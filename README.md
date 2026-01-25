@@ -6,7 +6,7 @@ This repository contains a single executable script: `simulation_plot_executable
 
 ## What it does
 
-- Simulates joint eigenvalues $(\\kappa_{p}, \\kappa_{p-1})$ for a given dimension `p` and number of instruments `k`, with noncentrality specified by `mu`.
+- Simulates joint eigenvalues $(\hat{\kappa}_{p}, \hat{\kappa}_{p-1})$ for a given dimension `p` and number of instruments `k`, with noncentrality specified by `mu`.
 - Estimates the median of $\\hat{\kappa}_{p-1}$ from a marginal simulation to define the conditioning value.
 - Computes and plots the empirical conditional CDF of $\hat{\kappa}\_{p} \mid \hat{\kappa}\_{p-1}$ for several $\kappa$ configurations.
 - Overlays an analytical conditional CDF approximation via the functions `g_k1`, `conditional_density`, and `get_conditional_cdf_GKM`, which represents the condititional cdf when the $p-2$ largest $\\kappa$ values are $\\infty$.
