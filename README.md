@@ -42,11 +42,7 @@ Enter a p>2: 3
 Enter the number of instruments k: 10
 ```
 
-$\begin{figure}[h]
-  \centering
-  \includegraphics[width=0.9\linewidth]{figures/example_figure.pdf}
-  \caption{Example image for p=3 and k=10 user inputs.}
-\end{figure}$
+![Example image for p=3 and n=10](figures/example_figure.png)
 
 
 An interactive Matplotlib window will open, showing:
