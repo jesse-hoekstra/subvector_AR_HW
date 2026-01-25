@@ -41,13 +41,9 @@ The script is interactive; it will prompt for `p` and `n`:
 Enter a p>2: 3
 Enter the number of instruments k: 10
 ```
-
+An interactive Matplotlib window will open, showing:
 ![Example image for p=3 and n=10](figures/example_figure.png)
 
-
-An interactive Matplotlib window will open, showing:
-- Empirical conditional CDF curves under three noncentrality patterns, and
-- An analytical approximation curve for comparison.
 
 ## Inputs and configurable knobs
 
