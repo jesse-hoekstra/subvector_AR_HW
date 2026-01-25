@@ -98,7 +98,7 @@ def get_conditional_cdf_GKM(conditional_density, g_k1, hat_k1, k):
     return x2_values, cdf_values
 #GKM formula end
 
-def get_omega_list(start, end, p, middle_value=2):
+def get_mu_list(start, end, p, middle_value=2):
     """
     Creates a list of p equispaced points under a square root, from sqrt(start) to sqrt(end),
     ensuring sqrt(middle_value) is included.
@@ -133,25 +133,25 @@ def get_omega_list(start, end, p, middle_value=2):
     second_half = np.sqrt(np.linspace(middle_value, end, second_half_points)[1:])
     return np.concatenate([first_half, second_half])
 
-def simulate_joint_eigenvalues(p, n, omega, num_simulations=1000):
+def simulate_joint_eigenvalues(p, k, mu, num_simulations=1000):
     """
     Simulates the joint distribution of the smallest and second smallest eigenvalues
     of a noncentral real Wishart matrix.
     
     Parameters:
     p (int): Dimensionality of the Wishart matrix.
-    n (int): Degrees of freedom (number of samples).
-    omega (ndarray): Eigenvalues of M^T M (noncentrality parameters).
+    k (int): Number of  instruments.
+    mu (ndarray): Singular values of M.
     num_simulations (int): Number of simulations.
     
     Returns:
     joint_eigenvalues (ndarray): Array of joint eigenvalues (smallest, second smallest).
     """
-    M = np.vstack([np.zeros((n-p, p)), np.diag(omega)])  # Diagonal matrix with sqrt(omega) as entries
+    M = np.vstack([np.zeros((k-p, p)), np.diag(mu)])  # Diagonal matrix with sqrt(kappa) as entries
     joint_eigenvalues = []
 
     for _ in range(num_simulations):
-        X = np.random.randn(n, p)
+        X = np.random.randn(k, p)
         X += M
         W = X.T @ X  # Compute the Wishart matrix
         eigvals = np.sort(np.linalg.eigvalsh(W))  # Sort eigenvalues in ascending order
@@ -163,25 +163,25 @@ def main():
     try:
         # Get user input
         p = int(input("Enter a p>2:"))
-        n = int(input("Enter the number of instruments n: "))
+        k = int(input("Enter the number of instruments k: "))
         num_simulations_marginal = 100000
         num_simulations_conditional = 1000000
         if not (p > 2):
             raise ValueError("p must be larger than 2")
-        if (n < p):
-            raise ValueError("n must be a positive integer bigger than p.")
+        if (k < p):
+            raise ValueError("k must be a positive integer bigger than p.")
 
         #simulation to get conditioning value
-        kappa_2_hats = simulate_joint_eigenvalues(p,n, get_omega_list(2,0,p), num_simulations_marginal)[:,1]
+        kappa_2_hats = simulate_joint_eigenvalues(p,k, get_mu_list(2,0,p), num_simulations_marginal)[:,1]
         kappa_2_hat = round(np.median(kappa_2_hats))
 
         #conditional simulation
         bin_width = 0.1
-        omega_values = [get_omega_list(2,0,p), get_omega_list(5,0,p), get_omega_list(10,0,p)] 
+        mu_values = [get_mu_list(2,0,p), get_mu_list(5,0,p), get_mu_list(10,0,p)] 
 
-        for omega in omega_values:
+        for mu in mu_values:
             # Simulate the joint eigenvalues
-            joint_eigenvalues = simulate_joint_eigenvalues(p, n, omega, num_simulations_conditional)
+            joint_eigenvalues = simulate_joint_eigenvalues(p, k, mu, num_simulations_conditional)
             smallest, second_smallest = joint_eigenvalues[:, 0], joint_eigenvalues[:, 1]
 
             # Filter smallest eigenvalues conditioned on second smallest eigenvalue
@@ -195,17 +195,17 @@ def main():
 
             plt.plot(conditioned_smallest_sorted, empirical_cdf, 
              label=f'(sim) CDF $\\hat{{\\kappa}}_{p}|\\hat{{\\kappa}}_{p-1}$ = {kappa_2_hat}, ' \
-            f'$\\kappa = ({", ".join(f"{x**2:.3g}" for x in omega)})$')
+            f'$\\kappa = ({", ".join(f"{x**2:.3g}" for x in mu)})$')
 
         #gkm conditional cdf
-        x2_values, conditional_cdf_GKM = get_conditional_cdf_GKM(conditional_density, g_k1, kappa_2_hat, n) 
+        x2_values, conditional_cdf_GKM = get_conditional_cdf_GKM(conditional_density, g_k1, kappa_2_hat, k) 
 
         plt.plot(x2_values, conditional_cdf_GKM, 
          label=fr'(approx) CDF $\hat{{\kappa}}_{p}|\hat{{\kappa}}_{p-1}$ = {kappa_2_hat}, ' \
         fr'$\kappa_{p-2} = (\infty)$')
 
         # Finalize the plot
-        plt.title(fr'Conditional CDF $\hat{{\kappa}}_{p}|\hat{{\kappa}}_{p-1}$ for $k={n}$ and Different Values $\kappa$')
+        plt.title(fr'Conditional CDF $\hat{{\kappa}}_{p}|\hat{{\kappa}}_{p-1}$ for $k={k}$ and Different Values $\kappa$')
         plt.xlabel(fr'$\hat{{\kappa}}_{p}$')
         plt.ylabel('Cumulative Probability')
         plt.legend()
