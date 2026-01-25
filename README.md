@@ -6,9 +6,9 @@ This repository contains a single executable script: `simulation_plot_executable
 
 ## What it does
 
-- Simulates joint eigenvalues $(\\kappa{p}, \\kappa{p-1})$ for a given dimension `p` and number of instruments `k`, with noncentrality specified by `mu`.
-- Estimates the median of \(\kappa_{2}\) from a marginal simulation to define the conditioning value $\\hat{\kappa}_{p-1}$.
-- Computes and plots the empirical conditional CDF of $\\kappa_{p} \mid \kappa_{p-1} \approx \hat{\kappa}_{p-1}$ for several kappa configuartions.
+- Simulates joint eigenvalues $(\\kappa_{p}, \\kappa_{p-1})$ for a given dimension `p` and number of instruments `k`, with noncentrality specified by `mu`.
+- Estimates the median of $\\kappa_{2}$ from a marginal simulation to define the conditioning value $\\hat{\kappa}_{p-1}$.
+- Computes and plots the empirical conditional CDF of $\\hat{\kappa}_{p} \mid \hat{\kappa}_{p-1}$ for several kappa configuartions.
 - Overlays an analytical conditional CDF approximation via the functions `g_k1`, `conditional_density`, and `get_conditional_cdf_GKM`, which represents the condititional cdf when the $p-2$ largest $\\kappa$ values are $\\infty$.
 
 ## Requirements
@@ -42,13 +42,12 @@ Enter a p>2: 3
 Enter the number of instruments k: 10
 ```
 
-```latex
-\begin{figure}[h]
+$\begin{figure}[h]
   \centering
   \includegraphics[width=0.9\linewidth]{figures/example_figure.pdf}
   \caption{Example image for p=3 and k=10 user inputs.}
-\end{figure}
-```
+\end{figure}$
+
 
 An interactive Matplotlib window will open, showing:
 - Empirical conditional CDF curves under three noncentrality patterns, and
