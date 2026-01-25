@@ -57,7 +57,7 @@ An interactive Matplotlib window will open, showing:
   - `get_mu_list(5, 0, p)`
   - `get_mu_list(10, 0, p)`
 
-`get_mu_list(start, end, p, middle_value=2)` returns `p` points that are evenly spaced after a square-root transform and include $\\sqrt{\text{middle\_value}}$.
+`get_mu_list(start, end, p, middle_value=2)` returns `p` points that are evenly spaced after a square-root transform and include $\\sqrt{\text{middle value}}$.
 
 ## How it works (high level)
 
