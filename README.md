@@ -50,7 +50,7 @@ An interactive Matplotlib window will open, showing:
 - **p**: integer > 2 (matrix dimension)
 - **k**: integer > p (number of instruments)
 - **Simulation sizes** (inside `main()`):
-  - `num_simulations_marginal = 100000` (used to estimate the conditioning value $\\hat{\kappa}_{p-1}$
+  - `num_simulations_marginal = 100000` (used to estimate the conditioning value $\\hat{\kappa}_{p-1}$)
   - `num_simulations_conditional = 1000000` (used for the empirical conditional CDF)
 - **Noncentrality patterns**: the script compares three settings:
   - `get_mu_list(2, 0, p)`
