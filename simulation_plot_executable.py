@@ -33,7 +33,7 @@ def g_k1(hat_k1, k):
         / (hat_k1 ** (k / 2) * np.sqrt(pi) * hypergeom_term)
     )
     
-    return g
+    return g #Ik plaats comment
 
 def conditional_density(x2, g_k1, hat_k1, k):
     """
