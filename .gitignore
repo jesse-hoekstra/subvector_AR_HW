@@ -16,5 +16,8 @@ research_papers
 *.dylib
 *.so
 
+# Downloaded Google Sites snapshot contains upstream browser API configuration
+koev/mhg_page.html
+
 # Run artifacts and generated outputs
 *.log
