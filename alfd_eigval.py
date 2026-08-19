@@ -52,10 +52,13 @@ from scipy.stats import chi2
 # no longer a numerical result that users have to tune by rerunning a curve.
 # ============================================================
 
-RESULT_SCHEMA_VERSION = 2
-ALGORITHM_VERSION = "emw_eigval_adaptive_v2"
+RESULT_SCHEMA_VERSION = 3
+ALGORITHM_VERSION = "emw_eigval_gkm_is_adaptive_v3"
 CALIBRATION_METHOD = "independent_mixture_quantile"
 BOUND_KIND = "simultaneous_mc_confidence_upper_conditional_on_density_accuracy"
+COMMON_GRID_METHOD = "strength_shape_3d_v1"
+POOLED_IS_METHOD = "gkm_stratified_equal_null_mixture_v1"
+CONFIDENCE_ALLOCATION_METHOD = "two_event_upper_separate_two_event_grid_v1"
 
 ALLOWED_CONFIGS = {
     (35, 25, 15): dict(
@@ -275,6 +278,7 @@ MHG_DEFAULT_BENCHMARK_SAMPLES = {
     (100, 30, 15): 16,
     (100, 95, 90): 2,
 }
+MHG_MAX_BENCHMARK_SAMPLES = 256
 
 
 class MHGConvergenceError(RuntimeError):
@@ -862,6 +866,126 @@ def validation_null_grid(fit_grid, alt_nuisance, standard_points,
     return result
 
 
+def common_null_grid_3d(alt_nuisance_rows, config_kappas, standard_points=None,
+                        n_shapes=6, n_strengths=7, max_strength=100.0):
+    """Deterministic common null grid for the three-dimensional nuisance cone.
+
+    GKM use 42 log-spaced points for their *scalar* nuisance parameter.  The
+    direct higher-dimensional analogue must cover both strength and shape.
+    This construction crosses nested shape directions with log-spaced largest
+    eigenvalues and adds the origin.  Defaults give ``1 + 6*7 = 43`` points.
+
+    Shape candidates prioritize the configuration and any supplied stress
+    directions, followed by rank-one/rank-two/rank-three boundaries and the
+    alternative-path shapes having the smallest and largest third-eigenvalue
+    share.  The production default requests nine shapes, retaining all of
+    those directions for the configured experiments.  Additional shapes are
+    deterministic interior directions.  The same ordered grid is used for
+    every beta, which permits the GKM pooled null table to be cached and reused.
+    Supplied stress points themselves are then appended as exact anchors when
+    they are not already present on a ray; this preserves the historical null
+    checks as well as their directions.
+    """
+    n_shapes = _validated_integer("n_shapes", n_shapes)
+    n_strengths = _validated_integer("n_strengths", n_strengths)
+    if n_shapes < 1 or n_strengths < 1:
+        raise ValueError("n_shapes and n_strengths must be positive")
+    if (not np.isfinite(max_strength)) or max_strength <= 0.1:
+        raise ValueError("max_strength must be finite and greater than 0.1")
+
+    config = np.asarray(config_kappas, dtype=float)
+    alternatives = np.asarray(alt_nuisance_rows, dtype=float)
+    standards = (np.empty((0, 3), dtype=float) if standard_points is None
+                 else np.asarray(standard_points, dtype=float))
+    if config.shape != (3,) or alternatives.ndim != 2 \
+            or alternatives.shape[1] != 3 or standards.ndim != 2 \
+            or standards.shape[1] != 3:
+        raise ValueError("common_null_grid_3d requires three-dimensional rows")
+    if (not np.all(np.isfinite(config))
+            or not np.all(np.isfinite(alternatives))
+            or not np.all(np.isfinite(standards))
+            or np.any(config < 0.0) or np.any(alternatives < 0.0)
+            or np.any(standards < 0.0)
+            or np.any(np.diff(config) > 1e-10)
+            or np.any(np.diff(alternatives, axis=1) > 1e-10)
+            or np.any(np.diff(standards, axis=1) > 1e-10)
+            or config[0] <= 0.0):
+        raise ValueError("grid inputs must be finite, nonnegative and descending")
+
+    def normalized(row):
+        row = np.asarray(row, dtype=float)
+        if row[0] <= 0.0:
+            return None
+        return tuple((row / row[0]).tolist())
+
+    alt_shapes = [normalized(row) for row in alternatives if row[0] > 0.0]
+    alt_shapes = [row for row in alt_shapes if row is not None]
+    if alt_shapes:
+        low_third = min(alt_shapes, key=lambda row: (row[2], row[1]))
+        high_third = max(alt_shapes, key=lambda row: (row[2], row[1]))
+    else:
+        low_third, high_third = (1.0, 0.75, 0.15), (1.0, 0.7, 0.55)
+
+    candidates = [normalized(config)]
+    candidates.extend(normalized(row) for row in standards)
+    candidates.extend([
+        (1.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (1.0, 1.0, 1.0),
+        low_third,
+        high_third,
+        (1.0, 0.25, 0.0),
+        (1.0, 0.5, 0.0),
+        (1.0, 0.75, 0.0),
+        (1.0, 0.35, 0.15),
+        (1.0, 0.5, 0.25),
+        (1.0, 0.75, 0.5),
+        (1.0, 0.9, 0.1),
+        (1.0, 0.9, 0.6),
+        (1.0, 0.6, 0.55),
+    ])
+    shapes, seen = [], set()
+    for row in candidates:
+        if row is None:
+            continue
+        ordered = tuple(sorted((float(x) for x in row), reverse=True))
+        key = tuple(round(x, 12) for x in ordered)
+        if key not in seen:
+            seen.add(key)
+            shapes.append(ordered)
+        if len(shapes) == n_shapes:
+            break
+    if len(shapes) < n_shapes:
+        # A deterministic low-discrepancy fallback for unusually large grids.
+        index = 1
+        while len(shapes) < n_shapes:
+            second = ((index * 0.6180339887498949) % 1.0)
+            third = ((index * 0.4142135623730950) % 1.0) * second
+            row = (1.0, second, third)
+            key = tuple(round(x, 12) for x in row)
+            if key not in seen:
+                seen.add(key)
+                shapes.append(row)
+            index += 1
+
+    strengths = np.geomspace(0.1, float(max_strength), n_strengths)
+    grid = [(0.0, 0.0, 0.0)]
+    for shape in shapes:
+        for strength in strengths:
+            grid.append(tuple(float(strength * x) for x in shape))
+    cartesian_size = 1 + n_shapes * n_strengths
+    if len(grid) != cartesian_size:
+        raise AssertionError("common-grid construction lost rows")
+    grid_keys = {tuple(round(x, 12) for x in row) for row in grid}
+    for row in standards:
+        anchor = tuple(float(x) for x in row)
+        key = tuple(round(x, 12) for x in anchor)
+        if key not in grid_keys:
+            grid_keys.add(key)
+            grid.append(anchor)
+    return grid
+
+
 # ============================================================
 # EMW/GKM calibration primitives
 # ============================================================
@@ -883,6 +1007,32 @@ class EMWFitResult:
     iterations: int
     converged: bool
     complementarity_residual: float
+
+
+@dataclass
+class PooledISBank:
+    """Stratified sample from an equal mixture of finite null laws.
+
+    ``base_weights`` contain the *fixed* stratified integration factors.  They
+    sum to one, but the target contributions ``base*f_j/q`` must never be
+    self-normalized: GKM equation (D.1) is ordinary importance sampling.
+    """
+    grid: np.ndarray
+    eigs: np.ndarray
+    log_f: np.ndarray
+    log_q: np.ndarray
+    base_weights: np.ndarray
+    strata: np.ndarray
+    n_per_stratum: int
+    role: str
+    bank_id: str
+    sampling_scheme: str = "stratified_null_gkm_is"
+    mhg_diagnostics: dict = None
+    sampling_seed: int = None
+    k_eff: int = None
+    experiment_signature: str = None
+    settings_json: str = None
+    content_signature: str = None
 
 
 @dataclass
@@ -910,6 +1060,15 @@ class ALFDBoundResult:
     invariant_benchmark_se: float
     invariant_benchmark_lower_confidence: float
     mhg_diagnostics: dict
+    full_weights: np.ndarray = None
+    active_indices: np.ndarray = None
+    active_null_grid: np.ndarray = None
+    discarded_weight_mass: float = 0.0
+    gkm_point_upper: float = np.nan
+    gkm_grid_lower: float = np.nan
+    gkm_epsilon: float = np.nan
+    importance_diagnostics: dict = None
+    grid_bracket_confidence_level: float = np.nan
 
 
 def _softmax(x):
@@ -965,6 +1124,191 @@ def calibrate_weighted_tail(scores, sample_weights, alpha,
         above += tie_mass
         i = j
     raise RuntimeError("failed to locate weighted tail quantile")
+
+
+def calibrate_raw_weighted_tail(scores, raw_contributions, alpha,
+                                method="gkm_ordinary_is_exact"):
+    """Calibrate an absolute ordinary-IS tail without self-normalization.
+
+    GKM equation (D.1) estimates an integral with fixed stratified weights.
+    Normalizing those contributions by their realized sum would silently turn
+    it into a different, biased finite-sample estimator.  Ties are randomized
+    so the *raw* estimated integral equals ``alpha`` exactly.
+    """
+    scores = np.asarray(scores, dtype=float).ravel()
+    weights = np.asarray(raw_contributions, dtype=float).ravel()
+    if scores.size == 0 or scores.shape != weights.shape:
+        raise ValueError("scores and raw contributions must be nonempty and aligned")
+    if (not np.all(np.isfinite(scores)) or not np.all(np.isfinite(weights))
+            or np.any(weights < 0.0) or not (0.0 < alpha < 1.0)):
+        raise ValueError("raw calibration inputs must be finite/nonnegative")
+    total = float(weights.sum())
+    if total < alpha - 1e-15:
+        raise ValueError(
+            f"ordinary-IS mass {total:.6g} is below alpha={alpha}; "
+            "the calibration bank is unusable")
+
+    order = np.argsort(scores, kind="mergesort")[::-1]
+    sorted_scores = scores[order]
+    sorted_weights = weights[order]
+    above = 0.0
+    i = 0
+    while i < scores.size:
+        j = i + 1
+        while j < scores.size and sorted_scores[j] == sorted_scores[i]:
+            j += 1
+        tie_mass = float(sorted_weights[i:j].sum())
+        if above <= alpha + 1e-15 and alpha <= above + tie_mass + 1e-15:
+            if tie_mass <= 0.0:
+                raise RuntimeError("zero-mass tie cannot attain raw alpha")
+            rho = float(np.clip((alpha - above) / tie_mass, 0.0, 1.0))
+            return TailRule(float(sorted_scores[i]), rho,
+                            float(above + rho * tie_mass), method)
+        above += tie_mass
+        i = j
+    raise RuntimeError("failed to locate ordinary-IS tail quantile")
+
+
+def _validate_pooled_is_bank(bank):
+    if not isinstance(bank, PooledISBank):
+        raise TypeError("expected a PooledISBank")
+    grid = np.asarray(bank.grid, dtype=float)
+    log_f = np.asarray(bank.log_f, dtype=float)
+    log_q = np.asarray(bank.log_q, dtype=float)
+    base = np.asarray(bank.base_weights, dtype=float)
+    raw_strata = np.asarray(bank.strata)
+    if not np.issubdtype(raw_strata.dtype, np.integer):
+        raise ValueError("invalid pooled GKM importance-sampling bank: "
+                         "strata must have an integer dtype")
+    strata = raw_strata.astype(int, copy=False)
+    eigs = np.asarray(bank.eigs, dtype=float)
+    H = grid.shape[0] if grid.ndim == 2 else 0
+    N = eigs.shape[0] if eigs.ndim == 2 else 0
+    try:
+        n_per_stratum = _validated_integer(
+            "n_per_stratum", bank.n_per_stratum, minimum=2)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid pooled GKM importance-sampling bank") from exc
+    if (H == 0 or N == 0 or log_f.shape != (H, N)
+            or log_q.shape != (N,) or base.shape != (N,)
+            or strata.shape != (N,) or not np.all(np.isfinite(grid))
+            or not np.all(np.isfinite(eigs)) or not np.all(np.isfinite(log_f))
+            or not np.all(np.isfinite(log_q)) or not np.all(np.isfinite(base))
+            or np.any(base <= 0.0) or not np.isclose(base.sum(), 1.0,
+                                                     atol=1e-12)
+            or grid.ndim != 2 or eigs.ndim != 2
+            or eigs.shape[1] != grid.shape[1] + 1
+            or np.any(grid < 0.0) or np.any(np.diff(grid, axis=1) > 1e-10)
+            or np.any(eigs < -1e-10) or np.any(np.diff(eigs, axis=1) > 1e-8)
+            or np.any(strata < 0) or np.any(strata >= H)
+            or bank.sampling_scheme != "stratified_null_gkm_is"
+            or bank.role not in ("training", "audit")
+            or not isinstance(bank.bank_id, str) or not bank.bank_id):
+        raise ValueError("invalid pooled GKM importance-sampling bank")
+    expected_base = np.full(N, 1.0 / N)
+    if not np.allclose(
+            base, expected_base, rtol=0.0,
+            atol=10.0 * np.finfo(float).eps / max(1, N)):
+        raise ValueError(
+            "invalid pooled GKM importance-sampling bank: equal-mixture "
+            "stratification requires base_i=1/N")
+    counts = np.bincount(strata, minlength=H)
+    expected_strata = np.repeat(np.arange(H, dtype=int), n_per_stratum)
+    if (np.any(counts != n_per_stratum)
+            or N != H * n_per_stratum
+            or not np.array_equal(strata, expected_strata)):
+        raise ValueError("pooled bank strata are incomplete or unbalanced")
+    expected_q = logsumexp(log_f - math.log(H), axis=0)
+    if not np.allclose(expected_q, log_q, rtol=0.0, atol=2e-12):
+        raise ValueError("pooled bank log_q is inconsistent with its null rows")
+    return H, N
+
+
+def _pooled_is_ratios(bank):
+    H, _ = _validate_pooled_is_bank(bank)
+    ratios = np.exp(bank.log_f - bank.log_q[None, :])
+    if (not np.all(np.isfinite(ratios)) or np.any(ratios < 0.0)
+            or np.max(ratios) > H * (1.0 + 2e-11)):
+        raise RuntimeError("GKM importance ratios violate the equal-mixture cap")
+    return ratios
+
+
+def gkm_importance_rejection_probabilities(bank, rejection_probabilities):
+    """Ordinary stratified-IS rejection probabilities for every grid null."""
+    rejection = np.asarray(rejection_probabilities, dtype=float).ravel()
+    _, N = _validate_pooled_is_bank(bank)
+    if (rejection.shape != (N,) or not np.all(np.isfinite(rejection))
+            or np.any((rejection < 0.0) | (rejection > 1.0))):
+        raise ValueError("rejection probabilities must be finite values in [0,1]")
+    ratios = _pooled_is_ratios(bank)
+    return ratios @ (bank.base_weights * rejection)
+
+
+def pooled_is_diagnostics(bank, rejection_probabilities=None):
+    """Mass, cap and ESS diagnostics for the ordinary GKM weights."""
+    ratios = _pooled_is_ratios(bank)
+    contributions = ratios * bank.base_weights[None, :]
+    mass = contributions.sum(axis=1)
+    ess = mass * mass / np.sum(contributions * contributions, axis=1)
+    result = dict(
+        raw_mass=mass,
+        observed_max_ratio=np.max(ratios, axis=1),
+        theoretical_max_ratio=float(bank.grid.shape[0]),
+        kish_ess=ess,
+        kish_ess_fraction=ess / ratios.shape[1],
+    )
+    if rejection_probabilities is not None:
+        rejection = np.asarray(rejection_probabilities, dtype=float).ravel()
+        if (rejection.shape != (ratios.shape[1],)
+                or not np.all(np.isfinite(rejection))
+                or np.any((rejection < 0.0) | (rejection > 1.0))):
+            raise ValueError(
+                "rejection probabilities must be finite values in [0,1]")
+        weighted = contributions * rejection[None, :]
+        tail_mass = weighted.sum(axis=1)
+        denom = np.sum(weighted * weighted, axis=1)
+        tail_ess = np.zeros_like(tail_mass)
+        np.divide(tail_mass * tail_mass, denom, out=tail_ess, where=denom > 0.0)
+        result["tail_mass"] = tail_mass
+        result["tail_ess"] = tail_ess
+    return result
+
+
+def common_grid_raw_is_tail_rule(scores, raw_target_contributions, alpha,
+                                 minimum_rule=None):
+    """GKM Step 8 common cutoff using ordinary-IS null contributions."""
+    scores = np.asarray(scores, dtype=float).ravel()
+    rows = np.asarray(raw_target_contributions, dtype=float)
+    if (rows.ndim != 2 or rows.shape[1] != scores.size
+            or not np.all(np.isfinite(rows)) or np.any(rows < 0.0)):
+        raise ValueError("raw target contributions must be H by N and nonnegative")
+    if minimum_rule is not None:
+        if (not isinstance(minimum_rule, TailRule)
+                or not np.isfinite(minimum_rule.threshold)
+                or not (0.0 <= minimum_rule.tie_probability <= 1.0)):
+            raise ValueError("minimum_rule must be a finite TailRule")
+    individual = [calibrate_raw_weighted_tail(
+        scores, row, alpha, method="gkm_grid_row_ordinary_is") for row in rows]
+    threshold = max(rule.threshold for rule in individual)
+    if minimum_rule is not None:
+        threshold = max(threshold, minimum_rule.threshold)
+
+    rho = 1.0
+    sizes = []
+    for row in rows:
+        above = float(row[scores > threshold].sum())
+        tied = float(row[scores == threshold].sum())
+        if above > alpha + 2e-12:
+            raise RuntimeError("ordinary-IS grid cutoff failed size control")
+        if tied > 0.0:
+            rho = min(rho, max(0.0, (alpha - above) / tied))
+        sizes.append((above, tied))
+    if minimum_rule is not None and threshold == minimum_rule.threshold:
+        rho = min(rho, minimum_rule.tie_probability)
+    rho = float(np.clip(rho, 0.0, 1.0))
+    attained = max(above + rho * tied for above, tied in sizes)
+    return TailRule(float(threshold), rho, float(attained),
+                    "gkm_grid_ordinary_is_size_at_most_alpha")
 
 
 def calibrate_empirical_tail(scores, alpha, method="empirical_exact"):
@@ -1189,6 +1533,380 @@ def fit_emw_weights(log_f, log_g, alpha=0.05, n_iter=600,
         complementarity_residual=float(residual))
 
 
+def fit_emw_weights_is(bank, log_g, alpha=0.05, n_iter=600,
+                       initial_step=2.0, min_step=0.01,
+                       active_weight_tol=1e-6, convergence_tol=None,
+                       convergence_patience=10):
+    """Fit EMW weights with GKM's pooled ordinary importance sampler."""
+    H, N = _validate_pooled_is_bank(bank)
+    log_g = np.asarray(log_g, dtype=float).ravel()
+    if log_g.shape != (N,) or not np.all(np.isfinite(log_g)):
+        raise ValueError("log_g must be finite and aligned with the pooled bank")
+    n_iter = _validated_integer("n_iter", n_iter)
+    convergence_patience = _validated_integer(
+        "convergence_patience", convergence_patience)
+    numeric_parameters = np.asarray(
+        [alpha, initial_step, min_step, active_weight_tol], dtype=float)
+    if (not np.all(np.isfinite(numeric_parameters))
+            or not (0.0 < alpha < 1.0)
+            or initial_step <= 0.0 or min_step <= 0.0
+            or min_step > initial_step
+            or not (0.0 <= active_weight_tol < 1.0)):
+        raise ValueError("invalid EMW fit parameters")
+    ratios = _pooled_is_ratios(bank)
+    max_contribution = float(np.max(ratios * bank.base_weights[None, :]))
+    if convergence_tol is None:
+        convergence_tol = max(2.0 * max_contribution, 5e-4)
+    elif (not np.isfinite(convergence_tol)) or convergence_tol <= 0.0:
+        raise ValueError("convergence_tol must be finite and positive")
+
+    mu = np.full(H, -2.0)
+    steps = np.full(H, float(initial_step))
+    previous_sign = np.zeros(H)
+    best = None
+    stable = 0
+    for iteration in range(1, n_iter + 1):
+        log_threshold = logsumexp(mu[:, None] + bank.log_f, axis=0)
+        rejection = (log_g > log_threshold).astype(float)
+        rp = ratios @ (bank.base_weights * rejection)
+        error = rp - alpha
+        weights = _softmax(mu)
+        active = weights > active_weight_tol
+        active_residual = (float(np.max(np.abs(error[active])))
+                           if np.any(active) else 0.0)
+        slack_residual = (float(np.max(np.maximum(error[~active], 0.0)))
+                          if np.any(~active) else 0.0)
+        residual = max(active_residual, slack_residual)
+        if best is None or residual < best[0]:
+            best = (residual, mu.copy(), iteration)
+        if residual <= convergence_tol:
+            stable += 1
+            if stable >= convergence_patience:
+                break
+        else:
+            stable = 0
+        sign = np.sign(error)
+        switched = ((previous_sign != 0.0) & (sign != 0.0)
+                    & (sign != previous_sign))
+        steps[switched] = np.maximum(min_step, 0.5 * steps[switched])
+        mu = mu + steps * error
+        previous_sign = sign
+
+    _, best_mu, best_iteration = best
+    weights = _softmax(best_mu)
+    log_mix = logsumexp(
+        _log_probability_weights(weights)[:, None] + bank.log_f, axis=0)
+    scores = log_g - log_mix
+    mix_contributions = bank.base_weights * np.exp(log_mix - bank.log_q)
+    training_rule = calibrate_raw_weighted_tail(
+        scores, mix_contributions, alpha,
+        method="gkm_training_mixture_ordinary_is")
+    rejection = tail_rejection_probabilities(scores, training_rule)
+    rp = ratios @ (bank.base_weights * rejection)
+    active = weights > active_weight_tol
+    active_residual = (float(np.max(np.abs(rp[active] - alpha)))
+                       if np.any(active) else 0.0)
+    slack_residual = (float(np.max(np.maximum(rp[~active] - alpha, 0.0)))
+                      if np.any(~active) else 0.0)
+    residual = max(active_residual, slack_residual)
+    return EMWFitResult(
+        weights=weights, mu=best_mu, rejection_probabilities=rp,
+        training_rule=training_rule, iterations=best_iteration,
+        converged=bool(residual <= convergence_tol),
+        complementarity_residual=float(residual))
+
+
+def compress_mixture(weights, max_active=None):
+    """Deterministically retain the largest weights and renormalize exactly.
+
+    Support selection uses training output only.  Every cutoff is recomputed
+    later on independent data, so the compressed distribution is simply a new
+    valid null mixture rather than an approximation used inside certification.
+    """
+    weights = np.asarray(weights, dtype=float).ravel()
+    if (weights.size == 0 or not np.all(np.isfinite(weights))
+            or np.any(weights < 0.0) or weights.sum() <= 0.0):
+        raise ValueError("mixture weights must be finite and nonnegative")
+    weights = weights / weights.sum()
+    if max_active is None:
+        keep_count = weights.size
+    else:
+        keep_count = min(_validated_integer("max_active", max_active), weights.size)
+        if keep_count < 1:
+            raise ValueError("max_active must be positive")
+    order = np.argsort(-weights, kind="mergesort")
+    active = np.sort(order[:keep_count])
+    dropped = float(1.0 - weights[active].sum())
+    retained = weights[active]
+    retained = retained / retained.sum()
+    return active, retained, max(0.0, dropped)
+
+
+def _pooled_experiment_settings(grid, k_eff, M_start, M_step, M_max,
+                                mhg_tol, metadata=None):
+    """Canonical density-experiment identity shared by train/audit banks."""
+    settings = dict(
+        schema_version=2, method=POOLED_IS_METHOD,
+        grid=np.asarray(grid, dtype=float).tolist(), k_eff=int(k_eff),
+        M_start=int(M_start), M_step=int(M_step), M_max=int(M_max),
+        mhg_tol=float(mhg_tol), density_formula="wishart_eigen_kernel_v1",
+    )
+    if metadata:
+        settings["provenance"] = _json_safe(metadata)
+    return settings
+
+
+def _canonical_pooled_mhg_diagnostics(diagnostics, expected_pairs):
+    """Validate and canonicalize the numerical audit attached to a bank."""
+    if not isinstance(diagnostics, dict):
+        raise ValueError("pooled bank MHG diagnostics must be a dictionary")
+    required = {
+        "pairs", "raw_evaluations", "order_counts", "max_order",
+        "max_remainder_ratio",
+    }
+    if not required.issubset(diagnostics):
+        raise ValueError("pooled bank MHG diagnostics are incomplete")
+    try:
+        pairs = int(diagnostics["pairs"])
+        raw = int(diagnostics["raw_evaluations"])
+        max_order = int(diagnostics["max_order"])
+        max_remainder = float(diagnostics["max_remainder_ratio"])
+        counts = {int(key): int(value)
+                  for key, value in diagnostics["order_counts"].items()}
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("pooled bank MHG diagnostics are malformed") from exc
+    if (pairs != int(expected_pairs) or raw < pairs or max_order < 0
+            or not np.isfinite(max_remainder) or max_remainder < 0.0
+            or any(key < 0 or value < 0 for key, value in counts.items())
+            or sum(counts.values()) != pairs
+            or (counts and max(counts) != max_order)):
+        raise ValueError("pooled bank MHG diagnostics are inconsistent")
+    return json.dumps(
+        _json_safe(diagnostics), sort_keys=True, separators=(",", ":"))
+
+
+def _pooled_bank_content_signature(diagnostics_json=None, **arrays):
+    """Hash the exact numeric payload of a reusable pooled bank."""
+    digest = hashlib.sha256()
+    for name in sorted(arrays):
+        array = np.ascontiguousarray(arrays[name])
+        digest.update(name.encode("utf-8"))
+        digest.update(array.dtype.str.encode("ascii"))
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.tobytes())
+    if diagnostics_json is not None:
+        digest.update(b"mhg_diagnostics_json")
+        digest.update(str(diagnostics_json).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _pooled_bank_settings(grid, role, k_eff, n_per_stratum, seed,
+                          M_start, M_step, M_max, mhg_tol, metadata=None):
+    experiment = _pooled_experiment_settings(
+        grid, k_eff, M_start, M_step, M_max, mhg_tol, metadata)
+    experiment_json = json.dumps(
+        experiment, sort_keys=True, separators=(",", ":"))
+    settings = dict(
+        **experiment, role=str(role), n_per_stratum=int(n_per_stratum),
+        seed=int(seed),
+        experiment_signature=hashlib.sha256(
+            experiment_json.encode()).hexdigest())
+    return settings
+
+
+def build_or_load_pooled_is_bank(grid, k_eff, n_per_stratum, seed,
+                                 M_start=20, M_step=MHG_DEFAULT_STEP,
+                                 M_max=MHG_DEFAULT_MAX, mhg_tol=MHG_CONV_TOL,
+                                 n_workers=1, role="training",
+                                 cache_dir=None, cache_metadata=None):
+    """Build/cache one beta-invariant GKM stratified null bank."""
+    grid = _validated_null_grid(grid, 3, "common pooled null grid")
+    n_per_stratum = _validated_integer(
+        "n_per_stratum", n_per_stratum, minimum=2)
+    k_eff = _validated_integer("k_eff", k_eff)
+    if role not in ("training", "audit"):
+        raise ValueError("pooled bank role must be 'training' or 'audit'")
+    settings = _pooled_bank_settings(
+        grid, role, k_eff, n_per_stratum, seed, M_start, M_step, M_max,
+        mhg_tol, cache_metadata)
+    canonical = json.dumps(settings, sort_keys=True, separators=(",", ":"))
+    bank_id = hashlib.sha256(canonical.encode()).hexdigest()
+    cache_path = (None if cache_dir is None else os.path.join(
+        cache_dir, f"pooled_{role}_{bank_id[:16]}.npz"))
+
+    if cache_path is not None and os.path.isfile(cache_path):
+        try:
+            with np.load(cache_path, allow_pickle=False) as archive:
+                saved_id = str(np.asarray(archive["bank_id"]).item())
+                if saved_id != bank_id:
+                    raise ValueError("bank signature differs")
+                saved_settings = str(
+                    np.asarray(archive["settings_json"]).item())
+                if saved_settings != canonical:
+                    raise ValueError("canonical bank settings differ")
+                raw_strata = np.asarray(archive["strata"])
+                if not np.issubdtype(raw_strata.dtype, np.integer):
+                    raise ValueError("cached strata are not integer-valued")
+                saved_diagnostics_json = str(np.asarray(
+                    archive["mhg_diagnostics_json"]).item())
+                diagnostics = json.loads(saved_diagnostics_json)
+                canonical_diagnostics_json = \
+                    _canonical_pooled_mhg_diagnostics(
+                        diagnostics,
+                        np.asarray(archive["log_f"]).shape[0]
+                        * np.asarray(archive["log_f"]).shape[1])
+                if saved_diagnostics_json != canonical_diagnostics_json:
+                    raise ValueError("cached MHG diagnostics are not canonical")
+                saved_content_signature = str(np.asarray(
+                    archive["content_signature"]).item())
+                bank = PooledISBank(
+                    grid=np.asarray(archive["grid"], dtype=float).copy(),
+                    eigs=np.asarray(archive["eigs"], dtype=float).copy(),
+                    log_f=np.asarray(archive["log_f"], dtype=float).copy(),
+                    log_q=np.asarray(archive["log_q"], dtype=float).copy(),
+                    base_weights=np.asarray(
+                        archive["base_weights"], dtype=float).copy(),
+                    strata=raw_strata.astype(int, copy=True),
+                    n_per_stratum=int(
+                        np.asarray(archive["n_per_stratum"]).item()),
+                    role=str(np.asarray(archive["role"]).item()),
+                    bank_id=saved_id, mhg_diagnostics=diagnostics,
+                    sampling_seed=int(
+                        np.asarray(archive["sampling_seed"]).item()),
+                    k_eff=int(np.asarray(archive["k_eff"]).item()),
+                    experiment_signature=str(np.asarray(
+                        archive["experiment_signature"]).item()),
+                    settings_json=saved_settings,
+                    content_signature=saved_content_signature)
+            computed_content_signature = _pooled_bank_content_signature(
+                grid=bank.grid, eigs=bank.eigs, log_f=bank.log_f,
+                log_q=bank.log_q, base_weights=bank.base_weights,
+                strata=bank.strata,
+                diagnostics_json=canonical_diagnostics_json)
+            if computed_content_signature != bank.content_signature:
+                raise ValueError("cached bank numeric content hash differs")
+            _validate_pooled_is_bank(bank)
+            if (bank.role != role or bank.sampling_seed != int(seed)
+                    or bank.k_eff != k_eff
+                    or bank.experiment_signature
+                    != settings["experiment_signature"]
+                    or not np.array_equal(
+                        bank.grid, np.asarray(grid, dtype=float))):
+                raise ValueError("cached bank metadata differs from the request")
+            print(f"  loaded compatible {role} pooled bank: {cache_path}",
+                  flush=True)
+            return bank
+        except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Cannot trust pooled-bank cache {cache_path}: {exc}. "
+                "Move the damaged cache aside and rerun.") from exc
+
+    H = len(grid)
+    p = 4
+    rng = np.random.default_rng(seed)
+    eigs = np.empty((H * n_per_stratum, p))
+    strata = np.repeat(np.arange(H, dtype=int), n_per_stratum)
+    for j, row in enumerate(grid):
+        start = j * n_per_stratum
+        stop = start + n_per_stratum
+        M_null = build_M(list(row) + [0.0], k_eff)
+        eigs[start:stop] = eigenvalues_descending(
+            simulate_Xi(M_null, n_per_stratum, rng))
+    omegas = np.asarray([list(row) + [0.0] for row in grid], dtype=float)
+    log_f, diagnostics = log_eigval_density_partial(
+        eigs, omegas, k_eff / 2.0, M_trunc=M_start, chunk_size=100,
+        progress_label=f"common-{role}-null", n_workers=n_workers,
+        M_step=M_step, M_max=M_max, mhg_tol=mhg_tol,
+        return_diagnostics=True)
+    log_q = logsumexp(log_f - math.log(H), axis=0)
+    base = np.full(H * n_per_stratum, 1.0 / (H * n_per_stratum))
+    diagnostics_json = _canonical_pooled_mhg_diagnostics(
+        diagnostics, H * (H * n_per_stratum))
+    content_signature = _pooled_bank_content_signature(
+        grid=np.asarray(grid, dtype=float), eigs=eigs, log_f=log_f,
+        log_q=log_q, base_weights=base, strata=strata,
+        diagnostics_json=diagnostics_json)
+    bank = PooledISBank(
+        grid=np.asarray(grid, dtype=float), eigs=eigs, log_f=log_f,
+        log_q=log_q, base_weights=base, strata=strata,
+        n_per_stratum=n_per_stratum, role=role, bank_id=bank_id,
+        mhg_diagnostics=diagnostics, sampling_seed=int(seed),
+        k_eff=k_eff,
+        experiment_signature=settings["experiment_signature"],
+        settings_json=canonical, content_signature=content_signature)
+    _validate_pooled_is_bank(bank)
+    if cache_path is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        _atomic_savez(
+            cache_path, bank_id=np.array(bank_id),
+            settings_json=np.array(canonical), role=np.array(role),
+            grid=bank.grid, eigs=bank.eigs, log_f=bank.log_f,
+            log_q=bank.log_q, base_weights=bank.base_weights,
+            strata=bank.strata,
+            n_per_stratum=np.array(bank.n_per_stratum),
+            sampling_seed=np.array(bank.sampling_seed),
+            k_eff=np.array(bank.k_eff),
+            experiment_signature=np.array(bank.experiment_signature),
+            content_signature=np.array(bank.content_signature),
+            mhg_diagnostics_json=np.array(diagnostics_json))
+        print(f"  saved {role} pooled bank cache: {cache_path}", flush=True)
+    return bank
+
+
+def _authenticated_pooled_bank_settings(bank):
+    """Parse and authenticate a bank's settings and numeric content."""
+    _validate_pooled_is_bank(bank)
+    if (not isinstance(bank.settings_json, str) or not bank.settings_json
+            or not isinstance(bank.content_signature, str)
+            or len(bank.content_signature) != 64):
+        raise ValueError("pooled bank lacks authenticated settings/content")
+    try:
+        settings = json.loads(bank.settings_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("pooled bank settings_json is malformed") from exc
+    canonical = json.dumps(settings, sort_keys=True, separators=(",", ":"))
+    if canonical != bank.settings_json:
+        raise ValueError("pooled bank settings_json is not canonical")
+    if hashlib.sha256(canonical.encode()).hexdigest() != bank.bank_id:
+        raise ValueError("pooled bank_id does not authenticate settings_json")
+    required = {
+        "schema_version", "method", "role", "grid", "k_eff",
+        "n_per_stratum", "seed", "M_start", "M_step", "M_max",
+        "mhg_tol", "density_formula", "experiment_signature",
+    }
+    if not required.issubset(settings):
+        raise ValueError("pooled bank settings are incomplete")
+    experiment = {key: value for key, value in settings.items()
+                  if key not in {
+                      "role", "n_per_stratum", "seed",
+                      "experiment_signature"}}
+    experiment_json = json.dumps(
+        experiment, sort_keys=True, separators=(",", ":"))
+    expected_experiment_signature = hashlib.sha256(
+        experiment_json.encode()).hexdigest()
+    if (settings["schema_version"] != 2
+            or settings["method"] != POOLED_IS_METHOD
+            or settings["role"] != bank.role
+            or int(settings["n_per_stratum"]) != bank.n_per_stratum
+            or int(settings["seed"]) != bank.sampling_seed
+            or int(settings["k_eff"]) != bank.k_eff
+            or settings["experiment_signature"]
+            != expected_experiment_signature
+            or bank.experiment_signature != expected_experiment_signature
+            or not np.array_equal(
+                np.asarray(settings["grid"], dtype=float), bank.grid)):
+        raise ValueError("pooled bank metadata is inconsistent")
+    diagnostics_json = _canonical_pooled_mhg_diagnostics(
+        bank.mhg_diagnostics, bank.log_f.shape[0] * bank.log_f.shape[1])
+    expected_content_signature = _pooled_bank_content_signature(
+        grid=bank.grid, eigs=bank.eigs, log_f=bank.log_f,
+        log_q=bank.log_q, base_weights=bank.base_weights,
+        strata=bank.strata, diagnostics_json=diagnostics_json)
+    if expected_content_signature != bank.content_signature:
+        raise ValueError("pooled bank content signature differs")
+    return settings
+
+
 # ============================================================
 # ALFD with eigenvalue density
 # ============================================================
@@ -1230,15 +1948,18 @@ def _combine_phase_mhg_diagnostics(phases):
     return combined
 
 
-def _exact_null_result(alpha, G):
+def _exact_null_result(alpha, G, null_grid=None):
     rule = TailRule(0.0, float(alpha), float(alpha),
                     "exact_null_randomization")
+    exact_weights = np.full(G, 1.0 / G)
+    active_grid = (None if null_grid is None
+                   else np.asarray(null_grid, dtype=float).copy())
     return ALFDBoundResult(
         upper_point=float(alpha), upper_point_se=0.0,
         upper_confidence=float(alpha), lower_grid_point=float(alpha),
         lower_grid_confidence=float(alpha), epsilon_grid_point=0.0,
         epsilon_grid_confidence=0.0, confidence_level=1.0,
-        weights=np.full(G, 1.0 / G),
+        weights=exact_weights,
         fit_rejection_probabilities=np.full(G, alpha),
         fit_complementarity_residual=0.0, fit_converged=True,
         fit_iterations=0,
@@ -1250,7 +1971,13 @@ def _exact_null_result(alpha, G):
         invariant_benchmark_lower_confidence=float(alpha),
         mhg_diagnostics=dict(pairs=0, raw_evaluations=0, max_order=0,
                              max_remainder_ratio=0.0,
-                             order_counts={}, phases={}))
+                             order_counts={}, phases={}),
+        full_weights=exact_weights.copy(), active_indices=np.arange(G),
+        active_null_grid=active_grid, discarded_weight_mass=0.0,
+        gkm_point_upper=float(alpha), gkm_grid_lower=float(alpha),
+        gkm_epsilon=0.0,
+        importance_diagnostics=dict(exact_null=True),
+        grid_bracket_confidence_level=1.0)
 
 
 def _validated_null_grid(rows, dimension, name):
@@ -1417,11 +2144,14 @@ def alfd_eigval_bound(kappas_alt, grid_kappas_null, k_eff,
     point_rule = calibrate_empirical_tail(
         scores_cal, alpha, method="independent_mixture_quantile")
 
-    # Split the requested per-point error probability over mixture calibration,
-    # upper power, simultaneous finite-grid size, and lower power.
-    delta_each = confidence_delta / 4.0
+    # The primary upper is a two-event confidence family: liberal mixture
+    # calibration plus the alternative-power CP limit.  The optional finite-
+    # grid lower is a separate two-event family.  This avoids making the upper
+    # unnecessarily loose merely because the diagnostic lower is requested.
+    upper_delta_each = confidence_delta / 2.0
+    grid_delta_each = confidence_delta / 2.0
     upper_conf_rule = confidence_liberal_tail_rule(
-        scores_cal, alpha, delta_each)
+        scores_cal, alpha, upper_delta_each)
     component_counts = np.bincount(cal_labels, minlength=G)
     del log_cal, eigs_cal, scores_cal
     gc.collect()
@@ -1448,7 +2178,7 @@ def alfd_eigval_bound(kappas_alt, grid_kappas_null, k_eff,
     lower_grid_rule = common_grid_tail_rule(
         scores_validation, alpha, minimum_rule=point_rule)
 
-    per_null_delta = delta_each / V
+    per_null_delta = grid_delta_each / V
     conservative_rules = [confidence_conservative_tail_rule(
         row, alpha, per_null_delta) for row in scores_validation]
     conservative_threshold = max(
@@ -1478,7 +2208,7 @@ def alfd_eigval_bound(kappas_alt, grid_kappas_null, k_eff,
     benchmark_se = float(np.sqrt(
         benchmark_power * (1.0 - benchmark_power) / int(n_sim_power)))
     benchmark_lower_confidence = clopper_pearson(
-        benchmark_count, int(n_sim_power), delta_each, "lower")
+        benchmark_count, int(n_sim_power), upper_delta_each, "lower")
 
     point_rejection = tail_rejection_probabilities(scores_power, point_rule)
     upper_point = float(np.mean(point_rejection))
@@ -1487,14 +2217,14 @@ def alfd_eigval_bound(kappas_alt, grid_kappas_null, k_eff,
     upper_conf_count = int(np.count_nonzero(
         scores_power > upper_conf_rule.threshold))
     upper_confidence = clopper_pearson(
-        upper_conf_count, int(n_sim_power), delta_each, "upper")
+        upper_conf_count, int(n_sim_power), upper_delta_each, "upper")
 
     lower_point = float(np.mean(
         tail_rejection_probabilities(scores_power, lower_grid_rule)))
     lower_conf_count = int(np.count_nonzero(
         scores_power > lower_grid_conf_rule.threshold))
     lower_confidence = clopper_pearson(
-        lower_conf_count, int(n_sim_power), delta_each, "lower")
+        lower_conf_count, int(n_sim_power), grid_delta_each, "lower")
 
     # The rules are nested by construction; these inequalities catch any future
     # regression in calibration/tie handling rather than clipping bad output.
@@ -1535,7 +2265,9 @@ def alfd_eigval_bound(kappas_alt, grid_kappas_null, k_eff,
         invariant_benchmark_power=benchmark_power,
         invariant_benchmark_se=benchmark_se,
         invariant_benchmark_lower_confidence=benchmark_lower_confidence,
-        mhg_diagnostics=_combine_phase_mhg_diagnostics(phase_diagnostics))
+        mhg_diagnostics=_combine_phase_mhg_diagnostics(phase_diagnostics),
+        grid_bracket_confidence_level=max(
+            0.0, 1.0 - 2.0 * confidence_delta))
     if verbose:
         print(f"    EMW point upper={upper_point:.5f} (SE {upper_point_se:.5f}); "
               f"confidence upper={upper_confidence:.5f}")
@@ -1551,8 +2283,329 @@ def alfd_eigval_bound(kappas_alt, grid_kappas_null, k_eff,
     return result if return_result else result.upper_confidence
 
 
+def alfd_eigval_bound_from_pooled_banks(
+        kappas_alt, training_bank, audit_bank, k_eff, alpha=0.05,
+        n_sim_calibration=20000, n_sim_power=50000, n_iter=600,
+        max_active_support=8, seed=42, verbose=True, n_workers=1,
+        confidence_delta=0.01, M_trunc=20, M_step=MHG_DEFAULT_STEP,
+        M_max=MHG_DEFAULT_MAX, mhg_tol=MHG_CONV_TOL):
+    """Hybrid GKM/EMW bound using shared IS discovery and iid certification.
+
+    The pooled banks may be reused across alternatives.  Only the training bank
+    selects weights/support.  The audit bank is independent, while mixture
+    calibration and alternative power use fresh iid streams.  Consequently the
+    saved confidence upper retains the same conditional finite-MC guarantee as
+    :func:`alfd_eigval_bound`.
+    """
+    k_eff = _validated_integer("k_eff", k_eff)
+    M_trunc = _validated_integer("M_trunc", M_trunc)
+    M_step = _validated_integer("M_step", M_step)
+    M_max = _validated_integer("M_max", M_max)
+    seed = _validated_integer("seed", seed, minimum=0)
+    if (M_trunc > M_max or not np.isfinite(mhg_tol)
+            or not (1e-13 <= mhg_tol < 1.0)):
+        raise ValueError("invalid adaptive-M settings")
+    H, N_train = _validate_pooled_is_bank(training_bank)
+    H_audit, N_audit = _validate_pooled_is_bank(audit_bank)
+    if (training_bank.role != "training" or audit_bank.role != "audit"
+            or training_bank.bank_id == audit_bank.bank_id):
+        raise ValueError("training and audit banks must be distinct and correctly typed")
+    if H != H_audit or not np.array_equal(training_bank.grid, audit_bank.grid):
+        raise ValueError("training and audit banks must use the same ordered grid")
+    if (training_bank.sampling_seed is None
+            or audit_bank.sampling_seed is None
+            or int(training_bank.sampling_seed) == int(audit_bank.sampling_seed)):
+        raise ValueError(
+            "training and audit banks must record distinct sampling seeds")
+    if seed in (int(training_bank.sampling_seed),
+                int(audit_bank.sampling_seed)):
+        raise ValueError(
+            "iid calibration/power seed must differ from pooled-bank seeds")
+    training_settings = _authenticated_pooled_bank_settings(training_bank)
+    audit_settings = _authenticated_pooled_bank_settings(audit_bank)
+    if (training_bank.experiment_signature is None
+            or training_bank.experiment_signature
+            != audit_bank.experiment_signature):
+        raise ValueError(
+            "training and audit banks must share one authenticated density "
+            "experiment")
+    if training_bank.content_signature == audit_bank.content_signature:
+        raise ValueError(
+            "training and audit banks have identical numeric content and "
+            "cannot support an independence claim")
+    if (training_bank.eigs.shape == audit_bank.eigs.shape
+            and np.array_equal(training_bank.eigs, audit_bank.eigs)):
+        raise ValueError(
+            "training and audit banks contain identical sampled eigenvalues "
+            "and cannot support an independence claim")
+    if (training_bank.k_eff is None or audit_bank.k_eff is None
+            or int(training_bank.k_eff) != int(k_eff)
+            or int(audit_bank.k_eff) != int(k_eff)):
+        raise ValueError("pooled banks were built for a different k_eff")
+    for settings in (training_settings, audit_settings):
+        if (int(settings["M_start"]) != M_trunc
+                or int(settings["M_step"]) != M_step
+                or int(settings["M_max"]) != M_max
+                or float(settings["mhg_tol"]) != float(mhg_tol)):
+            raise ValueError(
+                "call-time adaptive-M settings differ from pooled-bank "
+                "density settings")
+    if (training_bank.mhg_diagnostics is None
+            or audit_bank.mhg_diagnostics is None):
+        raise ValueError("certification banks must retain MHG diagnostics")
+
+    kappas_alt = np.asarray(kappas_alt, dtype=float)
+    p = kappas_alt.size
+    if (p != 4 or not np.all(np.isfinite(kappas_alt))
+            or np.any(kappas_alt < 0.0)
+            or np.any(np.diff(kappas_alt) > 1e-10)):
+        raise ValueError("pooled p=4 alternative eigenvalues are invalid")
+    if not (0.0 < alpha < 1.0) or not (0.0 < confidence_delta < 1.0):
+        raise ValueError("alpha and confidence_delta must lie in (0,1)")
+    n_sim_calibration = _validated_integer(
+        "n_sim_calibration", n_sim_calibration, minimum=2)
+    n_sim_power = _validated_integer("n_sim_power", n_sim_power, minimum=2)
+    if k_eff < p:
+        raise ValueError("k_eff must be at least p")
+
+    omega_alt = kappas_alt[None, :]
+    phase_diagnostics = {}
+    log_g_train_matrix, phase_diagnostics["training_alternative"] = \
+        log_eigval_density_partial(
+            training_bank.eigs, omega_alt, k_eff / 2.0,
+            M_trunc=M_trunc, chunk_size=100,
+            progress_label="shared-train-g", n_workers=n_workers,
+            M_step=M_step, M_max=M_max, mhg_tol=mhg_tol,
+            return_diagnostics=True)
+    log_g_train = log_g_train_matrix[0]
+    fit_full = fit_emw_weights_is(
+        training_bank, log_g_train, alpha=alpha, n_iter=n_iter)
+    active_indices, active_weights, dropped_mass = compress_mixture(
+        fit_full.weights, max_active=max_active_support)
+    active_grid = np.asarray(training_bank.grid)[active_indices]
+    active_log_f_train = training_bank.log_f[active_indices]
+
+    # GKM-comparable point calibration/tightening on the reusable discovery
+    # bank.  These are diagnostics, not the confidence-certified endpoint.
+    log_mix_train = logsumexp(
+        _log_probability_weights(active_weights)[:, None]
+        + active_log_f_train, axis=0)
+    scores_train = log_g_train - log_mix_train
+    mix_contributions = (training_bank.base_weights
+                         * np.exp(log_mix_train - training_bank.log_q))
+    gkm_point_rule = calibrate_raw_weighted_tail(
+        scores_train, mix_contributions, alpha,
+        method="gkm_reused_bank_mixture_ordinary_is")
+    target_contributions = (_pooled_is_ratios(training_bank)
+                            * training_bank.base_weights[None, :])
+    gkm_grid_rule = common_grid_raw_is_tail_rule(
+        scores_train, target_contributions, alpha,
+        minimum_rule=gkm_point_rule)
+    compressed_train_rp = gkm_importance_rejection_probabilities(
+        training_bank,
+        tail_rejection_probabilities(scores_train, gkm_point_rule))
+    active_mask = np.zeros(H, dtype=bool)
+    active_mask[active_indices] = True
+    active_residual = (float(np.max(np.abs(
+        compressed_train_rp[active_mask] - alpha)))
+        if np.any(active_mask) else 0.0)
+    slack_residual = (float(np.max(np.maximum(
+        compressed_train_rp[~active_mask] - alpha, 0.0)))
+        if np.any(~active_mask) else 0.0)
+    compressed_residual = max(active_residual, slack_residual)
+    max_contribution = float(np.max(
+        _pooled_is_ratios(training_bank)
+        * training_bank.base_weights[None, :]))
+    compressed_tolerance = max(2.0 * max_contribution, 5e-4)
+    compressed_converged = bool(compressed_residual <= compressed_tolerance)
+    is_diagnostics = pooled_is_diagnostics(
+        training_bank,
+        tail_rejection_probabilities(scores_train, gkm_point_rule))
+    is_diagnostics.update(
+        full_fit_converged=bool(fit_full.converged),
+        full_fit_complementarity_residual=float(
+            fit_full.complementarity_residual),
+        compressed_fit_converged=compressed_converged,
+        compressed_fit_complementarity_residual=float(compressed_residual),
+        compressed_fit_tolerance=float(compressed_tolerance))
+
+    if verbose:
+        print(f"    common GKM grid H={H}; pooled observations={N_train:,}; "
+              f"active support={len(active_indices)}; discarded weight="
+              f"{dropped_mass:.3e}")
+        print(f"    active grid indices={active_indices.tolist()}; weights="
+              f"{np.round(active_weights, 6).tolist()}")
+        print(f"    ordinary-IS mass range="
+              f"[{np.min(is_diagnostics['raw_mass']):.4f}, "
+              f"{np.max(is_diagnostics['raw_mass']):.4f}]; min ESS fraction="
+              f"{np.min(is_diagnostics['kish_ess_fraction']):.3f}", flush=True)
+
+    M_active = [build_M(list(row) + [0.0], k_eff) for row in active_grid]
+    omegas_active = np.asarray(
+        [list(row) + [0.0] for row in active_grid], dtype=float)
+    omegas_score = np.vstack([omegas_active, omega_alt])
+    rng_cal, rng_power = [np.random.default_rng(child) for child in
+                          np.random.SeedSequence(seed).spawn(2)]
+
+    # Fresh iid mixture calibration: this is deliberately not importance
+    # sampled, since the order-statistic confidence argument requires iid
+    # scores from the frozen mixture.
+    eigs_cal, cal_labels = _sample_mixture_eigenvalues(
+        M_active, active_weights, n_sim_calibration, rng_cal)
+    log_cal, phase_diagnostics["mixture_calibration"] = \
+        log_eigval_density_partial(
+            eigs_cal, omegas_score, k_eff / 2.0, M_trunc=M_trunc,
+            chunk_size=100, progress_label="iid-mixture-cal",
+            n_workers=n_workers, M_step=M_step, M_max=M_max,
+            mhg_tol=mhg_tol, return_diagnostics=True)
+    scores_cal = _score_from_log_densities(log_cal, active_weights)
+    point_rule = calibrate_empirical_tail(
+        scores_cal, alpha, method="independent_mixture_quantile")
+    upper_delta_each = confidence_delta / 2.0
+    grid_delta_each = confidence_delta / 2.0
+    upper_conf_rule = confidence_liberal_tail_rule(
+        scores_cal, alpha, upper_delta_each)
+    component_counts = np.bincount(
+        cal_labels, minlength=len(active_weights))
+    del eigs_cal, log_cal, scores_cal
+    gc.collect()
+
+    # Independent common-grid audit.  Samples are direct iid draws within each
+    # stratum, so the existing binomial order-statistic rules remain valid.
+    log_g_audit_matrix, phase_diagnostics["audit_alternative"] = \
+        log_eigval_density_partial(
+            audit_bank.eigs, omega_alt, k_eff / 2.0,
+            M_trunc=M_trunc, chunk_size=100,
+            progress_label="shared-audit-g", n_workers=n_workers,
+            M_step=M_step, M_max=M_max, mhg_tol=mhg_tol,
+            return_diagnostics=True)
+    log_mix_audit = logsumexp(
+        _log_probability_weights(active_weights)[:, None]
+        + audit_bank.log_f[active_indices], axis=0)
+    scores_audit = (log_g_audit_matrix[0] - log_mix_audit).reshape(
+        H, audit_bank.n_per_stratum)
+    validation_rp = np.mean(
+        tail_rejection_probabilities(scores_audit, point_rule), axis=1)
+    lower_grid_rule = common_grid_tail_rule(
+        scores_audit, alpha, minimum_rule=point_rule)
+    per_null_delta = grid_delta_each / H
+    conservative_rules = [confidence_conservative_tail_rule(
+        row, alpha, per_null_delta) for row in scores_audit]
+    conservative_threshold = max(
+        [upper_conf_rule.threshold]
+        + [rule.threshold for rule in conservative_rules])
+    lower_grid_conf_rule = TailRule(
+        float(conservative_threshold), 0.0,
+        float(np.max(np.mean(scores_audit > conservative_threshold, axis=1))),
+        "simultaneous_grid_order_statistic_size_at_most_alpha")
+
+    # Fresh alternative sample shared by all point/confidence endpoints.
+    M_alt = build_M(kappas_alt, k_eff)
+    eigs_power = eigenvalues_descending(
+        simulate_Xi(M_alt, n_sim_power, rng_power))
+    log_power, phase_diagnostics["alternative_power"] = \
+        log_eigval_density_partial(
+            eigs_power, omegas_score, k_eff / 2.0, M_trunc=M_trunc,
+            chunk_size=100, progress_label="iid-power", n_workers=n_workers,
+            M_step=M_step, M_max=M_max, mhg_tol=mhg_tol,
+            return_diagnostics=True)
+    scores_power = _score_from_log_densities(log_power, active_weights)
+
+    benchmark_rejection = (
+        eigs_power[:, -1] > chi2.ppf(1.0 - alpha, df=k_eff - p + 1))
+    benchmark_count = int(np.count_nonzero(benchmark_rejection))
+    benchmark_power = float(benchmark_count / n_sim_power)
+    benchmark_se = float(np.sqrt(
+        benchmark_power * (1.0 - benchmark_power) / n_sim_power))
+    benchmark_lower_confidence = clopper_pearson(
+        benchmark_count, n_sim_power, upper_delta_each, "lower")
+
+    point_rejection = tail_rejection_probabilities(scores_power, point_rule)
+    upper_point = float(np.mean(point_rejection))
+    upper_point_se = float(np.std(point_rejection, ddof=1)
+                           / np.sqrt(n_sim_power))
+    upper_conf_count = int(np.count_nonzero(
+        scores_power > upper_conf_rule.threshold))
+    upper_confidence = clopper_pearson(
+        upper_conf_count, n_sim_power, upper_delta_each, "upper")
+    lower_point = float(np.mean(
+        tail_rejection_probabilities(scores_power, lower_grid_rule)))
+    lower_conf_count = int(np.count_nonzero(
+        scores_power > lower_grid_conf_rule.threshold))
+    lower_confidence = clopper_pearson(
+        lower_conf_count, n_sim_power, grid_delta_each, "lower")
+    gkm_point_upper = float(np.mean(
+        tail_rejection_probabilities(scores_power, gkm_point_rule)))
+    gkm_grid_lower = float(np.mean(
+        tail_rejection_probabilities(scores_power, gkm_grid_rule)))
+
+    if lower_point > upper_point + 1e-12:
+        raise AssertionError("independent grid-tightened power exceeds point upper")
+    if lower_confidence > upper_confidence + 1e-12:
+        raise AssertionError("confidence bracket endpoints are reversed")
+    if gkm_grid_lower > gkm_point_upper + 1e-12:
+        raise AssertionError("GKM grid-tightened power exceeds its point upper")
+    if not np.isclose(point_rule.empirical_size, alpha, atol=5e-13):
+        raise AssertionError("iid mixture calibration did not attain alpha")
+    if upper_confidence + 1e-12 < alpha:
+        raise AssertionError("confidence upper bound fell below alpha")
+    if upper_confidence + 1e-12 < benchmark_lower_confidence:
+        raise AssertionError(
+            "EMW confidence upper is below the same-experiment benchmark lower")
+
+    # Shared bank diagnostics are recorded once in the bank cache; include them
+    # here for max-order/provenance inspection but callers should not sum these
+    # repeated per-beta counts as runtime work.
+    all_phases = dict(phase_diagnostics)
+    all_phases["shared_training_null_bank"] = training_bank.mhg_diagnostics
+    all_phases["shared_audit_null_bank"] = audit_bank.mhg_diagnostics
+    mhg_diagnostics = _combine_phase_mhg_diagnostics(all_phases)
+    result = ALFDBoundResult(
+        upper_point=upper_point, upper_point_se=upper_point_se,
+        upper_confidence=upper_confidence,
+        lower_grid_point=lower_point,
+        lower_grid_confidence=lower_confidence,
+        epsilon_grid_point=upper_point - lower_point,
+        epsilon_grid_confidence=upper_confidence - lower_confidence,
+        confidence_level=1.0 - confidence_delta,
+        weights=active_weights,
+        fit_rejection_probabilities=compressed_train_rp,
+        fit_complementarity_residual=compressed_residual,
+        fit_converged=compressed_converged,
+        fit_iterations=fit_full.iterations,
+        point_rule=point_rule, upper_confidence_rule=upper_conf_rule,
+        lower_grid_rule=lower_grid_rule,
+        lower_grid_confidence_rule=lower_grid_conf_rule,
+        calibration_component_counts=component_counts,
+        validation_rejection_probabilities=validation_rp,
+        invariant_benchmark_power=benchmark_power,
+        invariant_benchmark_se=benchmark_se,
+        invariant_benchmark_lower_confidence=benchmark_lower_confidence,
+        mhg_diagnostics=mhg_diagnostics,
+        full_weights=fit_full.weights, active_indices=active_indices,
+        active_null_grid=active_grid,
+        discarded_weight_mass=dropped_mass,
+        gkm_point_upper=gkm_point_upper,
+        gkm_grid_lower=gkm_grid_lower,
+        gkm_epsilon=gkm_point_upper - gkm_grid_lower,
+        importance_diagnostics=is_diagnostics,
+        grid_bracket_confidence_level=max(
+            0.0, 1.0 - 2.0 * confidence_delta))
+    if verbose:
+        print(f"    independent point upper={upper_point:.5f} "
+              f"(SE {upper_point_se:.5f}); confidence upper="
+              f"{upper_confidence:.5f}")
+        print(f"    independent finite-grid lower={lower_point:.5f}; "
+              f"epsilon={upper_point-lower_point:.5f}; max validation RP="
+              f"{validation_rp.max():.5f}")
+        print(f"    GKM reused-bank point/grid power="
+              f"{gkm_point_upper:.5f}/{gkm_grid_lower:.5f}; "
+              f"epsilon={gkm_point_upper-gkm_grid_lower:.5f}", flush=True)
+    return result
+
+
 # ============================================================
-# Driver: full 21-beta production curve
+# Driver: common-grid production curve (11 beta points by default)
 # ============================================================
 
 class _Tee:
@@ -1607,7 +2660,8 @@ def _format_duration(seconds):
 
 
 def _simulation_budget_diagnostics(alpha, curve_confidence, fit_grid_sizes,
-                                   validation_grid_sizes, budget):
+                                   validation_grid_sizes, budget,
+                                   events_per_family=4):
     """Return confidence ranks, precision diagnostics, and exact pair counts.
 
     ``fit_grid_sizes`` and ``validation_grid_sizes`` contain one entry for each
@@ -1635,7 +2689,11 @@ def _simulation_budget_diagnostics(alpha, curve_confidence, fit_grid_sizes,
 
     n_nonnull = int(fit_sizes.size)
     point_delta = (1.0 - float(curve_confidence)) / n_nonnull
-    event_delta = point_delta / 4.0
+    events_per_family = _validated_integer(
+        "events_per_family", events_per_family, minimum=2)
+    if events_per_family not in (2, 4):
+        raise ValueError("events_per_family must be 2 or 4")
+    event_delta = point_delta / float(events_per_family)
     calibration_count = _liberal_tail_rejection_count(
         n_cal, alpha, event_delta)
 
@@ -1672,6 +2730,10 @@ def _simulation_budget_diagnostics(alpha, curve_confidence, fit_grid_sizes,
     return dict(
         n_nonnull=n_nonnull, point_delta=float(point_delta),
         event_delta=float(event_delta),
+        events_per_family=int(events_per_family),
+        grid_bracket_curve_confidence=(
+            float(curve_confidence) if events_per_family == 4 else
+            max(0.0, 2.0 * float(curve_confidence) - 1.0)),
         n_fit=n_fit, fit_grid_min=int(fit_sizes.min()),
         fit_grid_max=int(fit_sizes.max()),
         fit_tail_se=float(math.sqrt(alpha * (1.0 - alpha) / n_fit)),
@@ -1688,18 +2750,64 @@ def _simulation_budget_diagnostics(alpha, curve_confidence, fit_grid_sizes,
         phase_pairs=phase_pairs, total_pairs=int(sum(phase_pairs.values())))
 
 
+def _common_is_budget_diagnostics(alpha, curve_confidence, common_grid_size,
+                                  n_nonnull, max_active_support, budget):
+    """Exact statistical ranks and logical-pair counts for the shared-bank path."""
+    H = _validated_integer("common_grid_size", common_grid_size)
+    B = _validated_integer("n_nonnull", n_nonnull)
+    K = min(_validated_integer("max_active_support", max_active_support), H)
+    result = _simulation_budget_diagnostics(
+        alpha, curve_confidence, [H] * B, [H] * B, budget,
+        events_per_family=2)
+    phase_pairs = dict(
+        shared_fit_null=int(H * H * result['n_fit']),
+        fit_alternative=int(B * H * result['n_fit']),
+        calibration=int(B * (K + 1) * result['n_calibration']),
+        shared_audit_null=int(H * H * result['n_validation']),
+        audit_alternative=int(B * H * result['n_validation']),
+        power=int(B * (K + 1) * result['n_power']),
+    )
+    result.update(
+        common_is=True, common_grid_size=H, max_active_support=K,
+        pooled_observations=int(H * result['n_fit']),
+        phase_pairs=phase_pairs,
+        total_pairs=int(sum(phase_pairs.values())))
+    return result
+
+
 def _print_simulation_budget_diagnostics(result, alpha, curve_confidence):
     """Explain the statistical consequences of one requested curve budget."""
     print("Statistical budget and confidence preflight:")
     print(f"  simultaneous confidence {curve_confidence:.3%} covers the "
           f"{result['n_nonnull']} computed non-null beta points only (not the "
           "interpolated continuum)")
-    print(f"  per-beta failure allowance={result['point_delta']:.3g}; "
-          f"each of 4 bracket events gets delta={result['event_delta']:.3g}")
-    print(f"  fit: n_fit={result['n_fit']:,} per null, G="
-          f"{result['fit_grid_min']}--{result['fit_grid_max']}; nominal "
-          f"Bernoulli SE at alpha={100 * result['fit_tail_se']:.3f} pp; "
-          f"n_iter={result['n_iter']} (fit quality/tightness, not validity)")
+    if result.get('events_per_family') == 2:
+        print(f"  per-beta failure allowance={result['point_delta']:.3g}; "
+              f"each of the 2 primary-upper events gets delta="
+              f"{result['event_delta']:.3g}")
+        print(f"  the finite-grid lower uses a separate 2-event family; the "
+              f"upper and lower jointly form at least a "
+              f"{result['grid_bracket_curve_confidence']:.3%} simultaneous "
+              "saved-grid bracket")
+    else:
+        print(f"  per-beta failure allowance={result['point_delta']:.3g}; "
+              f"each of 4 bracket events gets delta="
+              f"{result['event_delta']:.3g}")
+    if result.get('common_is'):
+        print(f"  fit: common H={result['common_grid_size']} strength/shape "
+              f"points, n_fit={result['n_fit']:,} per proposal "
+              f"({result['pooled_observations']:,} pooled observations); "
+              f"ordinary GKM importance sampling; active support capped at "
+              f"{result['max_active_support']}")
+        print(f"       nominal direct-tail SE reference="
+              f"{100 * result['fit_tail_se']:.3f} pp; actual IS precision is "
+              "reported by mass/ESS diagnostics; n_iter="
+              f"{result['n_iter']} reuses the bank")
+    else:
+        print(f"  fit: n_fit={result['n_fit']:,} per null, G="
+              f"{result['fit_grid_min']}--{result['fit_grid_max']}; nominal "
+              f"Bernoulli SE at alpha={100 * result['fit_tail_se']:.3f} pp; "
+              f"n_iter={result['n_iter']} (fit quality/tightness, not validity)")
     print(f"  calibration: n_calibration={result['n_calibration']:,}; "
           f"confidence-liberal rank rejects "
           f"{result['calibration_rejection_count']:,}/"
@@ -1736,6 +2844,12 @@ def _print_simulation_budget_diagnostics(result, alpha, curve_confidence):
         f"{name}={count:,} ({100.0 * count / total:.1f}%)"
         for name, count in result['phase_pairs'].items())
     print(f"  density-pair cost by phase: {phase_text}")
+    if result.get('common_is'):
+        print("  The null-density training/audit tables are each computed once "
+              "and reused across every beta. Counts shown are for a fresh run; "
+              "a compatible cached table removes its corresponding cost. The "
+              "current top-K compression retains exactly the displayed active "
+              "support count for every non-null beta.")
     print("  n_iter reuses fitted density tables and therefore adds no density "
           "pairs. Adaptive M retries do add raw C evaluations.\n", flush=True)
 
@@ -1748,20 +2862,22 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
 
     The benchmark owns its ``Generator`` and exits before a production run is
     initialized, so it neither consumes production random draws nor writes an
-    artifact.  Samples are genuine Xi'Xi eigenvalues from the median-trace
-    non-null alternative on the requested beta grid.  Each observation is
-    evaluated against every fitted-null density plus the alternative, matching
-    the production density-row composition.
-    Trace quantiles from a larger candidate pool reduce the noise of small
-    timing batches.
+    artifact.  Roughly two thirds of the samples span the common null grid and
+    one third are genuine Xi'Xi draws from the median-trace non-null
+    alternative.  This approximates the fresh production pair mix and exposes
+    costly boundary/stress draws that the former alternative-only benchmark
+    missed.  Every observation is evaluated against every fitted-null density
+    plus the alternative, matching production row batching.  Alternative trace
+    quantiles from a larger candidate pool reduce small-batch noise.
     """
     n_samples = _validated_integer("benchmark_samples", n_samples)
     n_workers = _validated_integer("n_workers", n_workers)
     k_eff = _validated_integer("k_eff", k_eff)
     total_logical_pairs = _validated_integer(
         "total_logical_pairs", total_logical_pairs)
-    if n_samples > 64:
-        raise ValueError("benchmark_samples must be <= 64")
+    if n_samples > MHG_MAX_BENCHMARK_SAMPLES:
+        raise ValueError(
+            f"benchmark_samples must be <= {MHG_MAX_BENCHMARK_SAMPLES}")
 
     betas = np.asarray(betas, dtype=float)
     ncp_table = np.asarray(ncp_table, dtype=float)
@@ -1795,21 +2911,35 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
     # SeedSequences.  The constant seed makes target-machine comparisons
     # repeatable even when the requested production seed changes.
     rng = np.random.default_rng(int(benchmark_seed))
-    pool_size = max(32, 4 * n_samples)
-    candidates = eigenvalues_descending(simulate_Xi(
-        build_M(representative_omega, k_eff), pool_size, rng))
-    ordered = np.argsort(candidates.sum(axis=1), kind="stable")
-    quantiles = np.linspace(0.25, 0.75, n_samples) if n_samples > 1 \
-        else np.array([0.5])
-    locations = np.rint(quantiles * (pool_size - 1)).astype(int)
-    samples = candidates[ordered[locations]]
+    n_null_samples = min(
+        n_samples, max(1, int(round(2.0 * n_samples / 3.0))))
+    n_alt_samples = n_samples - n_null_samples
+    grid_locations = np.rint(np.linspace(
+        0, len(fit_grid) - 1, n_null_samples)).astype(int)
+    null_samples = []
+    for location in grid_locations:
+        null_omega = list(fit_grid[int(location)]) + [0.0]
+        null_samples.append(eigenvalues_descending(simulate_Xi(
+            build_M(null_omega, k_eff), 1, rng))[0])
+    if n_alt_samples:
+        pool_size = max(32, 4 * n_alt_samples)
+        candidates = eigenvalues_descending(simulate_Xi(
+            build_M(representative_omega, k_eff), pool_size, rng))
+        ordered = np.argsort(candidates.sum(axis=1), kind="stable")
+        quantiles = (np.linspace(0.25, 0.75, n_alt_samples)
+                     if n_alt_samples > 1 else np.array([0.5]))
+        locations = np.rint(quantiles * (pool_size - 1)).astype(int)
+        samples = np.vstack([
+            np.asarray(null_samples), candidates[ordered[locations]]])
+    else:
+        samples = np.asarray(null_samples)
 
     benchmark_pairs = len(benchmark_omegas) * n_samples
     # chunked_mhg_batch parallelizes over samples; all Omega rows for one
     # sample stay in the same worker, matching the production batching path.
     benchmark_workers = min(n_workers, n_samples)
     benchmark_chunk_size = max(
-        1, int(math.ceil(n_samples / benchmark_workers)))
+        1, int(n_samples // benchmark_workers))
     started = time.perf_counter()
     values, diagnostics = chunked_mhg_batch(
         k_eff / 2.0, benchmark_omegas, samples,
@@ -1836,6 +2966,8 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
         representative_beta=float(betas[representative_index]),
         representative_omega=representative_omega,
         benchmark_scope=benchmark_scope,
+        null_samples=int(n_null_samples),
+        alternative_samples=int(n_alt_samples),
         omega_rows=int(len(benchmark_omegas)),
         fit_null_rows=int(len(benchmark_omegas) - 1),
         sample_trace_min=float(np.min(samples.sum(axis=1))),
@@ -1864,6 +2996,8 @@ def _print_mhg_benchmark(result):
           f"Omega={np.round(result['representative_omega'], 4).tolist()}")
     print(f"  sampled Xi'Xi trace range: {result['sample_trace_min']:.2f}"
           f"--{result['sample_trace_max']:.2f}")
+    print(f"  sample mix: {result['null_samples']} common-grid null + "
+          f"{result['alternative_samples']} representative alternative")
     print(f"  density-row scope: {result['benchmark_scope']} "
           f"({result['fit_null_rows']} fitted null + 1 alternative)")
     print(f"  {result['samples']} samples x {result['omega_rows']} Omega rows = "
@@ -1886,7 +3020,7 @@ def _print_mhg_benchmark(result):
     print("  Timing includes worker-pool startup, so tiny/easy batches are "
           "conservative and noisy.")
     print("  Benchmark used a private deterministic RNG stream and wrote no "
-          "artifact. Validation-grid extremes can be materially slower.\n",
+          "artifact. Rare high-order draws can still be materially slower.\n",
           flush=True)
 
 
@@ -1963,10 +3097,23 @@ def main():
     parser.add_argument('--n-validation', type=int, default=None)
     parser.add_argument('--n-power', type=int, default=None)
     parser.add_argument('--n-iter', type=int, default=None)
-    parser.add_argument('--validation-grid-size', type=int, default=None)
+    parser.add_argument(
+        '--validation-grid-size', type=int, default=None,
+        help=('deprecated for p=4; the common grid is controlled by '
+              '--grid-shapes and --grid-strengths'))
+    parser.add_argument('--grid-shapes', type=int, default=9,
+                        help=('common 3D nuisance-shape directions (default: 9; '
+                              'includes configured stress and rank-boundary shapes)'))
+    parser.add_argument('--grid-strengths', type=int, default=7,
+                        help='log-spaced strengths per direction (default: 7)')
+    parser.add_argument('--grid-max-strength', type=float, default=100.0,
+                        help='largest nuisance eigenvalue on common grid')
+    parser.add_argument('--max-active-support', type=int, default=8,
+                        help=('largest retained mixture support after fitting; '
+                              'the compressed mixture is independently recalibrated'))
     parser.add_argument(
         '--beta-count', type=int, default=None,
-        help='saved beta-grid size (default: 21; ignored by scalar smoke)')
+        help='saved beta-grid size (default: 11; ignored by scalar smoke)')
     args = parser.parse_args()
 
     k = 7
@@ -2012,9 +3159,22 @@ def main():
         if (not isinstance(budget[name], (int, np.integer))
                 or int(budget[name]) < 1):
             parser.error(f"--{name.replace('_', '-')} must be a positive integer")
-    beta_count = args.beta_count if args.beta_count is not None else 21
+    beta_count = args.beta_count if args.beta_count is not None else 11
     if beta_count < 1:
         parser.error("--beta-count must be positive")
+    if args.validation_grid_size is not None:
+        parser.error(
+            "--validation-grid-size was replaced by the common-grid controls "
+            "--grid-shapes and --grid-strengths")
+    if args.grid_shapes < 1 or args.grid_strengths < 1:
+        parser.error("--grid-shapes and --grid-strengths must be positive")
+    if (not np.isfinite(args.grid_max_strength)
+            or args.grid_max_strength <= 0.1):
+        parser.error("--grid-max-strength must be finite and greater than 0.1")
+    if args.max_active_support < 1:
+        parser.error("--max-active-support must be positive")
+    if args.seed < 0:
+        parser.error("--seed must be nonnegative")
     if not (0.0 < args.curve_confidence < 1.0):
         parser.error("--curve-confidence must lie in (0,1)")
     if not (1 <= M_start <= args.m_max) or args.m_step < 1:
@@ -2024,8 +3184,10 @@ def main():
     if args.benchmark_samples is not None:
         if not args.benchmark_preflight:
             parser.error("--benchmark-samples requires --benchmark-preflight")
-        if not (1 <= args.benchmark_samples <= 64):
-            parser.error("--benchmark-samples must lie in [1, 64]")
+        if not (1 <= args.benchmark_samples <= MHG_MAX_BENCHMARK_SAMPLES):
+            parser.error(
+                "--benchmark-samples must lie in "
+                f"[1, {MHG_MAX_BENCHMARK_SAMPLES}]")
     # High-order p=4 work arrays are large.  Keep automatic parallelism
     # conservative; explicit --workers remains available after the user checks
     # the machine's memory budget.
@@ -2060,43 +3222,36 @@ def main():
     point_delta = ((1.0 - args.curve_confidence)
                    / max(1, int(np.count_nonzero(nonnull))))
 
-    prepared_grids = []
+    common_grid = common_null_grid_3d(
+        ncp_table[:, :-1], kappas, standard_points=standard_points,
+        n_shapes=args.grid_shapes,
+        n_strengths=args.grid_strengths,
+        max_strength=args.grid_max_strength)
+    H_common = len(common_grid)
+    grid_anchor_count = H_common - (1 + args.grid_shapes * args.grid_strengths)
+    if not (0 <= grid_anchor_count <= len(standard_points)):
+        raise AssertionError("unexpected common-grid anchor count")
+    active_cap = min(args.max_active_support, H_common)
     logical_pairs_by_beta = np.zeros(n_betas, dtype=np.int64)
-    for i, ncp in enumerate(ncp_table):
-        alt_nuisance = ncp[:-1]
-        grid_null = lean_null_grid(
-            alt_nuisance, standard_points, n_perturb=8,
-            seed=args.seed + 101 * i)
-        grid_validation = validation_null_grid(
-            grid_null, alt_nuisance, standard_points,
-            n_points=budget['validation_grid_size'],
-            seed=args.seed + 1009 * i)
-        prepared_grids.append((grid_null, grid_validation))
-        if nonnull[i]:
-            logical_pairs_by_beta[i] = (
-                (len(grid_null) + 1)
-                * (len(grid_null) * budget['n_fit']
-                   + budget['n_calibration']
-                   + len(grid_validation) * budget['n_validation']
-                   + budget['n_power']))
-
-    total_logical_pairs = int(logical_pairs_by_beta.sum())
+    per_beta_variable = (
+        H_common * (budget['n_fit'] + budget['n_validation'])
+        + (active_cap + 1)
+        * (budget['n_calibration'] + budget['n_power']))
+    logical_pairs_by_beta[nonnull] = per_beta_variable
     nonnull_indices = np.flatnonzero(nonnull)
     if nonnull_indices.size:
-        fit_sizes = [len(prepared_grids[i][0]) for i in nonnull_indices]
-        validation_sizes = [len(prepared_grids[i][1]) for i in nonnull_indices]
         try:
-            budget_diagnostics = _simulation_budget_diagnostics(
-                alpha, args.curve_confidence, fit_sizes, validation_sizes,
-                budget)
+            budget_diagnostics = _common_is_budget_diagnostics(
+                alpha, args.curve_confidence, H_common,
+                int(nonnull_indices.size), active_cap, budget)
         except ValueError as exc:
             parser.error(f"invalid statistical budget: {exc}")
-        if budget_diagnostics['total_pairs'] != total_logical_pairs:
-            raise AssertionError("budget phase counts do not match total pair count")
+        total_logical_pairs = budget_diagnostics['total_pairs']
         _print_simulation_budget_diagnostics(
             budget_diagnostics, alpha, args.curve_confidence)
     else:
         budget_diagnostics = None
+        total_logical_pairs = 0
         print("Statistical budget preflight: beta grid contains only the exact "
               "null, so no Monte Carlo density evaluations are needed.\n")
 
@@ -2134,7 +3289,7 @@ def main():
             ncp_table, betas_alfd, total_logical_pairs, k,
             M_start, args.m_step, args.m_max, args.mhg_rtol,
             n_workers, benchmark_samples,
-            fit_grids=[grids[0] for grids in prepared_grids])
+            fit_grids=[common_grid for _ in range(n_betas)])
         _print_mhg_benchmark(benchmark)
         return
 
@@ -2162,14 +3317,32 @@ def main():
         scipy_version=scipy.__version__,
         platform=platform.platform(),
     )
+    training_bank_seed = int(np.random.SeedSequence(
+        [args.seed, 0x47534B4D]).generate_state(1, dtype=np.uint32)[0])
+    audit_bank_seed = int(np.random.SeedSequence(
+        [args.seed, 0x41554449]).generate_state(1, dtype=np.uint32)[0])
     run_settings = dict(
         version_label=args.version, kappas=kappas.tolist(), k=k, n=n,
         alpha=alpha, profile=args.profile, seed=args.seed,
         M_start=M_start, M_step=args.m_step, M_max=args.m_max,
         mhg_rtol=args.mhg_rtol, curve_confidence=args.curve_confidence,
         beta_count=beta_count,
-        fit_grid_strategy='alt_standard_plus_8_perturbations',
-        **budget, **provenance)
+        fit_grid_strategy=COMMON_GRID_METHOD,
+        pooled_importance_method=POOLED_IS_METHOD,
+        confidence_allocation_method=CONFIDENCE_ALLOCATION_METHOD,
+        common_grid=common_grid,
+        grid_shapes=args.grid_shapes,
+        grid_strengths=args.grid_strengths,
+        grid_max_strength=args.grid_max_strength,
+        grid_anchor_count=grid_anchor_count,
+        max_active_support=active_cap,
+        training_bank_seed=training_bank_seed,
+        audit_bank_seed=audit_bank_seed,
+        n_fit=budget['n_fit'],
+        n_calibration=budget['n_calibration'],
+        n_validation=budget['n_validation'],
+        n_power=budget['n_power'], n_iter=budget['n_iter'],
+        **provenance)
     run_signature = hashlib.sha256(json.dumps(
         run_settings, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
@@ -2209,7 +3382,12 @@ def main():
     print(f"  betas: {len(betas_alfd)} in [{betas_alfd[0]:+.2f}, {betas_alfd[-1]:+.2f}]")
     print(f"  adaptive M: start={M_start}, step={args.m_step}, max={args.m_max}, "
           f"rtol={args.mhg_rtol:.1e}; parallelism={n_workers}")
-    print(f"  standard null points: {standard_points}")
+    print(f"  common null grid: H={H_common} = origin + "
+          f"{args.grid_shapes} shapes x {args.grid_strengths} strengths; "
+          f"{grid_anchor_count} additional exact stress anchors; maximum "
+          f"strength={args.grid_max_strength:g}")
+    print(f"  active mixture support cap={active_cap}; pooled method="
+          f"{POOLED_IS_METHOD}")
     print(f"  profile={args.profile}, seed={args.seed}, budgets={budget}")
     print(f"  simultaneous MC confidence={args.curve_confidence:.3%}")
     print(f"  acknowledged preflight: {total_logical_pairs:,} logical pairs; "
@@ -2218,6 +3396,20 @@ def main():
     print(f"  run signature={run_signature}\n")
 
     t_total = time.time()
+
+    # These beta-invariant null tables are the principal GKM computational
+    # reuse.  Their cache keys authenticate the grid, RNG stream, adaptive-M
+    # settings and current density implementation.
+    training_bank = build_or_load_pooled_is_bank(
+        common_grid, k, budget['n_fit'], training_bank_seed,
+        M_start=M_start, M_step=args.m_step, M_max=args.m_max,
+        mhg_tol=args.mhg_rtol, n_workers=n_workers, role="training",
+        cache_dir=out_dir, cache_metadata=provenance)
+    audit_bank = build_or_load_pooled_is_bank(
+        common_grid, k, budget['n_validation'], audit_bank_seed,
+        M_start=M_start, M_step=args.m_step, M_max=args.m_max,
+        mhg_tol=args.mhg_rtol, n_workers=n_workers, role="audit",
+        cache_dir=out_dir, cache_metadata=provenance)
 
     bounds_confidence = np.full(n_betas, np.nan)
     bounds_point = np.full(n_betas, np.nan)
@@ -2234,7 +3426,15 @@ def main():
     fit_iterations = np.zeros(n_betas, dtype=int)
     max_validation_rp = np.full(n_betas, np.nan)
     max_m_used = np.zeros(n_betas, dtype=int)
-    diagnostics_json = np.full(n_betas, '', dtype='<U20000')
+    active_support_count = np.zeros(n_betas, dtype=int)
+    discarded_weight_mass = np.full(n_betas, np.nan)
+    gkm_point_upper = np.full(n_betas, np.nan)
+    gkm_grid_lower = np.full(n_betas, np.nan)
+    gkm_epsilon = np.full(n_betas, np.nan)
+    fitted_weights_full = np.full((n_betas, H_common), np.nan)
+    retained_weights = np.full((n_betas, active_cap), np.nan)
+    retained_indices = np.full((n_betas, active_cap), -1, dtype=int)
+    diagnostics_json = np.full(n_betas, '', dtype='<U100000')
 
     checkpoint_arrays = dict(
         bounds_confidence=bounds_confidence, bounds_point=bounds_point,
@@ -2247,6 +3447,13 @@ def main():
         fit_residual=fit_residual, fit_converged=fit_converged,
         fit_iterations=fit_iterations,
         max_validation_rp=max_validation_rp, max_m_used=max_m_used,
+        active_support_count=active_support_count,
+        discarded_weight_mass=discarded_weight_mass,
+        gkm_point_upper=gkm_point_upper,
+        gkm_grid_lower=gkm_grid_lower, gkm_epsilon=gkm_epsilon,
+        fitted_weights_full=fitted_weights_full,
+        retained_weights=retained_weights,
+        retained_indices=retained_indices,
         diagnostics_json=diagnostics_json)
     if os.path.isfile(partial_npz) and not args.force:
         try:
@@ -2283,30 +3490,30 @@ def main():
 
         ncp = ncp_table[i]
         ncp_str = "[" + ", ".join(f"{x:5.2f}" for x in ncp) + "]"
-        grid_null, grid_validation = prepared_grids[i]
-
         exact_null = not nonnull[i]
+        beta_seed = None
         if exact_null:
             print(f"  NCP={ncp_str}; exact rank-deficient alternative -> "
                   f"randomized bound alpha={alpha}", flush=True)
+            result = _exact_null_result(alpha, H_common, common_grid)
         else:
-            print(f"  NCP={ncp_str}; |fit grid|={len(grid_null)}, "
-                  f"|validation grid|={len(grid_validation)}; "
-                  f"logical density pairs={logical_pairs_by_beta[i]:,}",
+            print(f"  NCP={ncp_str}; common grid H={H_common}; "
+                  f"active support cap={active_cap}; beta-specific logical "
+                  f"density pairs={logical_pairs_by_beta[i]:,}",
                   flush=True)
-
-        result = alfd_eigval_bound(
-            kappas_alt=tuple(ncp), grid_kappas_null=grid_null, k_eff=k,
-            alpha=alpha, n_sim=budget['n_fit'],
-            n_sim_calibration=budget['n_calibration'],
-            n_sim_validation=budget['n_validation'],
-            n_sim_power=budget['n_power'], n_iter=budget['n_iter'],
-            M_trunc=M_start, M_step=args.m_step, M_max=args.m_max,
-            mhg_tol=args.mhg_rtol, seed=args.seed + 7919 * i,
-            verbose=not exact_null, n_workers=n_workers,
-            validation_grid_kappas_null=grid_validation,
-            confidence_delta=point_delta, return_result=True,
-            alternative_is_exact_null=exact_null)
+            beta_seed = int(np.random.SeedSequence(
+                [args.seed, 0x42455441, i]).generate_state(
+                    1, dtype=np.uint32)[0])
+            result = alfd_eigval_bound_from_pooled_banks(
+                kappas_alt=tuple(ncp), training_bank=training_bank,
+                audit_bank=audit_bank, k_eff=k, alpha=alpha,
+                n_sim_calibration=budget['n_calibration'],
+                n_sim_power=budget['n_power'], n_iter=budget['n_iter'],
+                max_active_support=active_cap,
+                M_trunc=M_start, M_step=args.m_step, M_max=args.m_max,
+                mhg_tol=args.mhg_rtol, seed=beta_seed,
+                verbose=True, n_workers=n_workers,
+                confidence_delta=point_delta)
 
         bounds_confidence[i] = result.upper_confidence
         bounds_point[i] = result.upper_point
@@ -2324,8 +3531,26 @@ def main():
         fit_iterations[i] = result.fit_iterations
         max_validation_rp[i] = float(np.max(result.validation_rejection_probabilities))
         max_m_used[i] = int(result.mhg_diagnostics['max_order'])
-        diagnostics_json[i] = json.dumps(_json_safe(dict(
+        active_support_count[i] = (0 if exact_null else len(result.weights))
+        discarded_weight_mass[i] = result.discarded_weight_mass
+        gkm_point_upper[i] = result.gkm_point_upper
+        gkm_grid_lower[i] = result.gkm_grid_lower
+        gkm_epsilon[i] = result.gkm_epsilon
+        if result.full_weights is not None:
+            if np.asarray(result.full_weights).shape != (H_common,):
+                raise RuntimeError("fitted full-weight vector has wrong shape")
+            fitted_weights_full[i] = result.full_weights
+        if not exact_null:
+            count = active_support_count[i]
+            retained_weights[i, :count] = result.weights
+            retained_indices[i, :count] = result.active_indices
+        diagnostic_record = json.dumps(_json_safe(dict(
             weights=result.weights,
+            certification_seed=beta_seed,
+            full_weights=result.full_weights,
+            active_indices=result.active_indices,
+            active_null_grid=result.active_null_grid,
+            discarded_weight_mass=result.discarded_weight_mass,
             fit_rejection_probabilities=result.fit_rejection_probabilities,
             point_rule=result.point_rule,
             upper_confidence_rule=result.upper_confidence_rule,
@@ -2333,7 +3558,18 @@ def main():
             lower_grid_confidence_rule=result.lower_grid_confidence_rule,
             calibration_component_counts=result.calibration_component_counts,
             validation_rejection_probabilities=result.validation_rejection_probabilities,
+            gkm_point_upper=result.gkm_point_upper,
+            gkm_grid_lower=result.gkm_grid_lower,
+            gkm_epsilon=result.gkm_epsilon,
+            importance=result.importance_diagnostics,
+            grid_bracket_confidence_level=(
+                result.grid_bracket_confidence_level),
             mhg=result.mhg_diagnostics)), sort_keys=True)
+        if len(diagnostic_record) > diagnostics_json.dtype.itemsize // 4:
+            raise RuntimeError(
+                "per-beta diagnostic JSON exceeds the checkpoint field; "
+                "increase its declared width rather than truncating it")
+        diagnostics_json[i] = diagnostic_record
 
         _atomic_savez(
             partial_npz, run_signature=np.array(run_signature),
@@ -2349,6 +3585,10 @@ def main():
               f"{bounds_confidence[i]:.5f}")
         print(f"     finite-grid lower={lower_grid_point[i]:.5f}; "
               f"epsilon={epsilon_grid_point[i]:.5f}; max M={max_m_used[i]}")
+        if not exact_null:
+            print(f"     active support={active_support_count[i]}/{H_common}; "
+                  f"discarded fitted mass={discarded_weight_mass[i]:.3e}; "
+                  f"GKM reused-bank epsilon={gkm_epsilon[i]:.5f}")
         print(f"     (this beta: {elapsed:.0f}s = {elapsed/60:.1f} min; "
               f"avg {avg:.0f}s/beta; ETA remainder: {eta/60:.1f} min)\n",
               flush=True)
@@ -2368,6 +3608,8 @@ def main():
         schema_version=np.array(RESULT_SCHEMA_VERSION),
         algorithm=np.array(ALGORITHM_VERSION), producer=np.array('alfd_eigval.py'),
         calibration_method=np.array(CALIBRATION_METHOD),
+        confidence_allocation_method=np.array(
+            CONFIDENCE_ALLOCATION_METHOD),
         bound_kind=np.array(BOUND_KIND),
         confidence_scope=np.array('saved_beta_grid_only'),
         density_accuracy_scope=np.array('adaptive_empirical_tail_criterion'),
@@ -2393,9 +3635,33 @@ def main():
         fit_converged=fit_converged,
         fit_iterations=fit_iterations,
         max_validation_rejection_probability=max_validation_rp,
-        max_m_used=max_m_used, diagnostics_json=diagnostics_json,
+        max_m_used=max_m_used,
+        common_null_grid=np.asarray(common_grid, dtype=float),
+        common_grid_size=np.array(H_common),
+        active_support_count=active_support_count,
+        discarded_weight_mass=discarded_weight_mass,
+        fitted_weights_full=fitted_weights_full,
+        retained_weights=retained_weights,
+        retained_indices=retained_indices,
+        gkm_point_upper=gkm_point_upper,
+        gkm_grid_lower=gkm_grid_lower, gkm_epsilon=gkm_epsilon,
+        training_bank_id=np.array(training_bank.bank_id),
+        audit_bank_id=np.array(audit_bank.bank_id),
+        training_bank_content_signature=np.array(
+            training_bank.content_signature),
+        audit_bank_content_signature=np.array(audit_bank.content_signature),
+        pooled_experiment_signature=np.array(
+            training_bank.experiment_signature),
+        training_bank_mhg_diagnostics_json=np.array(json.dumps(
+            _json_safe(training_bank.mhg_diagnostics), sort_keys=True)),
+        audit_bank_mhg_diagnostics_json=np.array(json.dumps(
+            _json_safe(audit_bank.mhg_diagnostics), sort_keys=True)),
+        diagnostics_json=diagnostics_json,
         ncp=ncp_table, kappas=kappas, k=np.array(k), n=np.array(n),
         alpha=np.array(alpha), curve_confidence=np.array(args.curve_confidence),
+        grid_lower_curve_confidence=np.array(args.curve_confidence),
+        grid_bracket_curve_confidence=np.array(
+            max(0.0, 2.0 * args.curve_confidence - 1.0)),
         point_confidence_delta=np.array(point_delta), M_start=np.array(M_start),
         M_step=np.array(args.m_step), M_max=np.array(args.m_max),
         mhg_rtol=np.array(args.mhg_rtol), seed=np.array(args.seed),
@@ -2403,7 +3669,11 @@ def main():
         n_calibration=np.array(budget['n_calibration']),
         n_validation=np.array(budget['n_validation']),
         n_power=np.array(budget['n_power']), n_iter=np.array(budget['n_iter']),
-        validation_grid_size=np.array(budget['validation_grid_size']))
+        grid_shapes=np.array(args.grid_shapes),
+        grid_strengths=np.array(args.grid_strengths),
+        grid_max_strength=np.array(args.grid_max_strength),
+        grid_anchor_count=np.array(grid_anchor_count),
+        max_active_support=np.array(active_cap))
     _atomic_savez(out_npz, **save_payload)
     if os.path.isfile(partial_npz):
         os.unlink(partial_npz)

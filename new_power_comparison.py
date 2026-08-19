@@ -17,12 +17,16 @@ from gkm import critical_value
 # to overlay.  In particular, do not silently fall back to the legacy
 # M_trunc-specific files: those files have no algorithm/schema provenance and
 # may have been produced by the pre-calibration implementation.
-ALFD_SCHEMA_VERSION = 2
-ALFD_ALGORITHM = 'emw_eigval_adaptive_v2'
+ALFD_SCHEMA_VERSION = 3
+ALFD_ALGORITHM = 'emw_eigval_gkm_is_adaptive_v3'
 ALFD_PRODUCER = 'alfd_eigval.py'
 ALFD_CALIBRATION_METHOD = 'independent_mixture_quantile'
 ALFD_BOUND_KIND = (
     'simultaneous_mc_confidence_upper_conditional_on_density_accuracy')
+ALFD_COMMON_GRID_METHOD = 'strength_shape_3d_v1'
+ALFD_POOLED_IS_METHOD = 'gkm_stratified_equal_null_mixture_v1'
+ALFD_CONFIDENCE_ALLOCATION_METHOD = (
+    'two_event_upper_separate_two_event_grid_v1')
 
 DGP_CACHE_SCHEMA_VERSION = 1
 DGP_CACHE_ALGORITHM = 'appendix_a3_feasible_power_v1'
@@ -227,6 +231,188 @@ def load_compatible_dgp_cache(path, *, version_label, kappas, k, n, alpha,
             archive['power_cp1'], betas)
 
 
+def _is_plain_integer(value, *, minimum=None):
+    """Return whether ``value`` is an integer (but not bool) in range."""
+    valid = (isinstance(value, (int, np.integer))
+             and not isinstance(value, (bool, np.bool_)))
+    if valid and minimum is not None:
+        valid = int(value) >= int(minimum)
+    return bool(valid)
+
+
+def _validate_alfd_v3_strategy_settings(saved_settings, archive, mismatches):
+    """Validate the signed common-grid/GKM-IS part of the v3 contract.
+
+    These fields are not decorative provenance.  They distinguish the v3
+    higher-dimensional workflow from both the old beta-specific random grids
+    and from a self-normalized importance-sampling approximation.
+    """
+    expected_methods = {
+        'fit_grid_strategy': ALFD_COMMON_GRID_METHOD,
+        'pooled_importance_method': ALFD_POOLED_IS_METHOD,
+        'confidence_allocation_method': ALFD_CONFIDENCE_ALLOCATION_METHOD,
+    }
+    for name, expected in expected_methods.items():
+        saved = saved_settings.get(name)
+        if saved != expected:
+            mismatches.append(
+                f'settings_json {name}={saved!r} (expected {expected!r})')
+
+    integer_fields = {
+        'grid_shapes': 1,
+        'grid_strengths': 1,
+        'grid_anchor_count': 0,
+        'max_active_support': 1,
+        'training_bank_seed': 0,
+        'audit_bank_seed': 0,
+    }
+    parsed_integers = {}
+    for name, minimum in integer_fields.items():
+        value = saved_settings.get(name)
+        if not _is_plain_integer(value, minimum=minimum):
+            mismatches.append(
+                f'settings_json {name}={value!r} is not an integer >= {minimum}')
+        else:
+            parsed_integers[name] = int(value)
+
+    anchor_count = parsed_integers.get('grid_anchor_count')
+    if anchor_count is not None and anchor_count > 4:
+        mismatches.append(
+            'settings_json grid_anchor_count must lie in [0, 4]')
+
+    if (parsed_integers.get('training_bank_seed') ==
+            parsed_integers.get('audit_bank_seed')):
+        mismatches.append(
+            'settings_json training and audit bank seeds must be distinct')
+
+    max_strength = saved_settings.get('grid_max_strength')
+    try:
+        valid_max_strength = bool(
+            not isinstance(max_strength, (bool, np.bool_))
+            and np.isfinite(max_strength) and float(max_strength) > 0.1)
+    except (TypeError, ValueError):
+        valid_max_strength = False
+    if not valid_max_strength:
+        mismatches.append(
+            'settings_json grid_max_strength must be finite and greater than 0.1')
+
+    try:
+        common_grid = np.asarray(saved_settings['common_grid'], dtype=float)
+    except (KeyError, TypeError, ValueError):
+        common_grid = None
+        mismatches.append(
+            "settings_json has invalid or missing 'common_grid'")
+    else:
+        grid_valid = bool(
+            common_grid.ndim == 2 and common_grid.shape[0] > 0
+            and common_grid.shape[1] == 3
+            and np.all(np.isfinite(common_grid))
+            and np.all(common_grid >= 0.0)
+            and np.all(np.diff(common_grid, axis=1) <= 1e-12))
+        if not grid_valid:
+            mismatches.append(
+                'settings_json common_grid must be a nonempty finite '
+                'nonnegative descending H-by-3 array')
+            common_grid = None
+        elif not np.allclose(
+                common_grid[0], 0.0, rtol=0.0, atol=1e-14):
+            mismatches.append('settings_json common_grid must start at the origin')
+        elif np.unique(common_grid, axis=0).shape[0] != common_grid.shape[0]:
+            mismatches.append('settings_json common_grid contains duplicate rows')
+
+    if common_grid is not None:
+        n_shapes = parsed_integers.get('grid_shapes')
+        n_strengths = parsed_integers.get('grid_strengths')
+        cartesian_size = None
+        if (n_shapes is not None and n_strengths is not None
+                and anchor_count is not None):
+            cartesian_size = 1 + n_shapes * n_strengths
+            expected_rows = cartesian_size + anchor_count
+            if common_grid.shape[0] != expected_rows:
+                mismatches.append(
+                    f'settings_json common_grid has {common_grid.shape[0]} rows; '
+                    'grid_shapes/grid_strengths/grid_anchor_count imply '
+                    f'{expected_rows}')
+        active_cap = parsed_integers.get('max_active_support')
+        if active_cap is not None and active_cap > common_grid.shape[0]:
+            mismatches.append(
+                'settings_json max_active_support exceeds the common-grid size')
+        if (valid_max_strength and cartesian_size is not None
+                and common_grid.shape[0] >= cartesian_size):
+            ray_grid = common_grid[:cartesian_size]
+            if not np.isclose(
+                    np.max(ray_grid[:, 0]), float(max_strength),
+                    rtol=1e-12, atol=1e-12):
+                mismatches.append(
+                    'settings_json grid_max_strength disagrees with ray grid')
+            expected_strengths = np.geomspace(
+                0.1, float(max_strength), n_strengths)
+            for shape_index in range(n_shapes):
+                start = 1 + shape_index * n_strengths
+                block = ray_grid[start:start + n_strengths]
+                if (block.shape != (n_strengths, 3)
+                        or not np.allclose(
+                            block[:, 0], expected_strengths,
+                            rtol=1e-12, atol=1e-12)
+                        or not np.allclose(
+                            block / block[:, :1],
+                            np.repeat(
+                                (block[:1] / block[:1, :1]),
+                                n_strengths, axis=0),
+                            rtol=1e-12, atol=1e-12)):
+                    mismatches.append(
+                        'settings_json common_grid ray block '
+                        f'{shape_index} is inconsistent with the declared '
+                        'strength-by-shape design')
+                    break
+
+    scalar_settings = {
+        'grid_shapes': parsed_integers.get('grid_shapes'),
+        'grid_strengths': parsed_integers.get('grid_strengths'),
+        'grid_anchor_count': parsed_integers.get('grid_anchor_count'),
+        'grid_max_strength': (float(max_strength)
+                              if valid_max_strength else None),
+        'max_active_support': parsed_integers.get('max_active_support'),
+        'common_grid_size': (None if common_grid is None
+                             else int(common_grid.shape[0])),
+    }
+    for name, expected in scalar_settings.items():
+        if name not in archive.files:
+            mismatches.append(f"missing metadata key {name!r}")
+            continue
+        saved = np.asarray(archive[name])
+        if saved.shape != ():
+            mismatches.append(
+                f"metadata key {name!r} must be scalar, got shape {saved.shape}")
+            continue
+        if expected is None:
+            continue
+        saved = saved.item()
+        if isinstance(expected, float):
+            try:
+                matches = bool(np.isclose(
+                    saved, expected, rtol=0.0, atol=1e-12))
+            except TypeError:
+                matches = False
+        else:
+            matches = (_is_plain_integer(saved)
+                       and int(saved) == int(expected))
+        if not matches:
+            mismatches.append(
+                f'{name}={saved!r} disagrees with signed settings_json')
+
+    if 'common_null_grid' not in archive.files:
+        mismatches.append("missing required result array 'common_null_grid'")
+    elif common_grid is not None:
+        saved_grid = np.asarray(archive['common_null_grid'], dtype=float)
+        if (saved_grid.shape != common_grid.shape
+                or not np.allclose(saved_grid, common_grid,
+                                   rtol=0.0, atol=1e-12)):
+            mismatches.append(
+                'common_null_grid disagrees with signed settings_json common_grid')
+    return common_grid, parsed_integers.get('max_active_support')
+
+
 def load_compatible_alfd_bound(path, *, version_label, kappas, k, n, alpha,
                                return_metadata=False):
     """Load and validate one calibrated adaptive-EMW bound artifact.
@@ -241,6 +427,8 @@ def load_compatible_alfd_bound(path, *, version_label, kappas, k, n, alpha,
         producer = _npz_scalar(archive, 'producer')
         saved_version = _npz_scalar(archive, 'version_label')
         calibration_method = _npz_scalar(archive, 'calibration_method')
+        confidence_allocation_method = _npz_scalar(
+            archive, 'confidence_allocation_method')
         bound_kind = _npz_scalar(archive, 'bound_kind')
         saved_k = _npz_scalar(archive, 'k')
         saved_n = _npz_scalar(archive, 'n')
@@ -300,6 +488,11 @@ def load_compatible_alfd_bound(path, *, version_label, kappas, k, n, alpha,
             mismatches.append(
                 f"calibration_method={calibration_method!r} "
                 f"(expected {ALFD_CALIBRATION_METHOD!r})")
+        if confidence_allocation_method != ALFD_CONFIDENCE_ALLOCATION_METHOD:
+            mismatches.append(
+                f"confidence_allocation_method="
+                f"{confidence_allocation_method!r} (expected "
+                f"{ALFD_CONFIDENCE_ALLOCATION_METHOD!r})")
         if bound_kind != ALFD_BOUND_KIND:
             mismatches.append(
                 f"bound_kind={bound_kind!r} (expected {ALFD_BOUND_KIND!r})")
@@ -339,11 +532,16 @@ def load_compatible_alfd_bound(path, *, version_label, kappas, k, n, alpha,
             mismatches.append(
                 f'profile={profile!r} cannot produce a plottable p=4 artifact')
 
+        common_grid, max_active_support = \
+            _validate_alfd_v3_strategy_settings(
+                saved_settings, archive, mismatches)
+
         settings_scalar_expectations = {
             'schema_version': schema_version,
             'algorithm': algorithm,
             'producer': producer,
             'calibration_method': calibration_method,
+            'confidence_allocation_method': confidence_allocation_method,
             'version_label': saved_version,
             'k': saved_k,
             'n': saved_n,
@@ -402,7 +600,10 @@ def load_compatible_alfd_bound(path, *, version_label, kappas, k, n, alpha,
         if mismatches:
             raise ValueError("incompatible metadata: " + "; ".join(mismatches))
 
-        required_arrays = ('betas', 'bounds', 'bounds_se')
+        required_arrays = (
+            'betas', 'bounds', 'bounds_se', 'common_null_grid',
+            'active_support_count', 'discarded_weight_mass',
+            'gkm_point_upper', 'gkm_grid_lower', 'gkm_epsilon')
         missing = [name for name in required_arrays if name not in archive.files]
         if missing:
             raise ValueError(
@@ -411,6 +612,16 @@ def load_compatible_alfd_bound(path, *, version_label, kappas, k, n, alpha,
         betas = np.asarray(archive['betas'], dtype=float).copy()
         bounds = np.asarray(archive['bounds'], dtype=float).copy()
         bounds_se = np.asarray(archive['bounds_se'], dtype=float).copy()
+        active_support_count_raw = np.asarray(
+            archive['active_support_count']).copy()
+        discarded_weight_mass = np.asarray(
+            archive['discarded_weight_mass'], dtype=float).copy()
+        gkm_point_upper = np.asarray(
+            archive['gkm_point_upper'], dtype=float).copy()
+        gkm_grid_lower = np.asarray(
+            archive['gkm_grid_lower'], dtype=float).copy()
+        gkm_epsilon = np.asarray(
+            archive['gkm_epsilon'], dtype=float).copy()
 
         beta_count = saved_settings.get('beta_count')
         if (not isinstance(beta_count, (int, np.integer))
@@ -437,10 +648,55 @@ def load_compatible_alfd_bound(path, *, version_label, kappas, k, n, alpha,
     if np.any(bounds_se < 0.0):
         raise ValueError("bounds_se must be nonnegative")
 
+    support_arrays = {
+        'active_support_count': active_support_count_raw,
+        'discarded_weight_mass': discarded_weight_mass,
+        'gkm_point_upper': gkm_point_upper,
+        'gkm_grid_lower': gkm_grid_lower,
+        'gkm_epsilon': gkm_epsilon,
+    }
+    bad_shapes = [name for name, value in support_arrays.items()
+                  if value.shape != betas.shape]
+    if bad_shapes:
+        raise ValueError(
+            'v3 active-support/GKM arrays must match the beta grid: '
+            + ', '.join(bad_shapes))
+    if not np.issubdtype(active_support_count_raw.dtype, np.integer):
+        raise ValueError('active_support_count must have an integer dtype')
+    active_support_count = active_support_count_raw.astype(np.int64)
+    if (max_active_support is None
+            or np.any(active_support_count < 0)
+            or np.any(active_support_count > max_active_support)):
+        raise ValueError(
+            'active_support_count lies outside [0, max_active_support]')
+    if (not np.all(np.isfinite(discarded_weight_mass))
+            or np.any(discarded_weight_mass < 0.0)
+            or np.any(discarded_weight_mass >= 1.0)):
+        raise ValueError('discarded_weight_mass must be finite and in [0, 1)')
+    if (not np.all(np.isfinite(gkm_point_upper))
+            or not np.all(np.isfinite(gkm_grid_lower))
+            or not np.all(np.isfinite(gkm_epsilon))
+            or np.any((gkm_point_upper < 0.0) | (gkm_point_upper > 1.0))
+            or np.any((gkm_grid_lower < 0.0) | (gkm_grid_lower > 1.0))
+            or np.any(gkm_grid_lower > gkm_point_upper + 1e-12)
+            or np.any(gkm_epsilon < -1e-12)
+            or not np.allclose(
+                gkm_epsilon, gkm_point_upper - gkm_grid_lower,
+                rtol=0.0, atol=1e-12)):
+        raise ValueError('invalid GKM point/grid diagnostic arrays')
+
     if return_metadata:
         return betas, bounds, bounds_se, {
             'curve_confidence': float(curve_confidence),
             'profile': profile,
+            'common_grid_size': int(common_grid.shape[0]),
+            'grid_anchor_count': int(
+                saved_settings['grid_anchor_count']),
+            'max_active_support': int(max_active_support),
+            'fit_grid_strategy': ALFD_COMMON_GRID_METHOD,
+            'pooled_importance_method': ALFD_POOLED_IS_METHOD,
+            'confidence_allocation_method': (
+                ALFD_CONFIDENCE_ALLOCATION_METHOD),
         }
     return betas, bounds, bounds_se
 

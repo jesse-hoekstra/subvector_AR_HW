@@ -7,7 +7,8 @@ __pycache__/
 .venv/
 venv/
 .claude
-docs 
+docs/*
+!docs/ALFD_power_bound_method.md
 research_papers
 
 

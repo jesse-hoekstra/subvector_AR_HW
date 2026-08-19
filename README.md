@@ -49,26 +49,35 @@ An interactive Matplotlib window will open, showing:
 
 ## EMW power bound
 
-The corrected bound driver uses independent mixture calibration, a finite-grid
-GKM epsilon check, Monte Carlo confidence limits, and per-density adaptive
-matrix-hypergeometric truncation:
+The corrected p=4 bound driver uses one deterministic 68-point
+strength-by-shape null grid for the whole curve. It reuses beta-invariant
+stratified null banks with ordinary (not self-normalized) GKM importance
+sampling, compresses the fitted mixture to at most eight active rows by
+default, and then uses fresh direct iid samples for calibration, audit, and
+Monte Carlo confidence limits. Matrix-hypergeometric truncation adapts for
+every individual density pair.
 
 ```bash
 sh koev/mhg15/build.sh
-python3 alfd_eigval.py --version 1009590 --profile production --preflight-only
-python3 alfd_eigval.py --version 1009590 --profile production \
-  --benchmark-preflight --workers 8
-python3 alfd_eigval.py --version 1009590 --profile production \
+python3 alfd_eigval.py --version 352515 --profile smoke
+python3 alfd_eigval.py --version 352515 --profile production \
+  --preflight-only --workers 16
+python3 alfd_eigval.py --version 352515 --profile production \
+  --benchmark-preflight --benchmark-samples 64 --workers 16
+python3 alfd_eigval.py --version 352515 --profile production \
+  --workers 16 \
   --acknowledge-expensive
-python3 new_power_comparison.py --version 1009590 --preflight-only
-python3 new_power_comparison.py --version 1009590 --acknowledge-expensive
+python3 new_power_comparison.py --version 352515 --preflight-only
+python3 new_power_comparison.py --version 352515 --acknowledge-expensive
 ```
 
 Corrected bound artifacts are written under `<version>/adaptive/`, and
 provenance-checked finite-sample caches under `<version>/dgp/`. Legacy
 `M_trunc_*` files are intentionally not loaded. Matrix-hypergeometric order is
 selected separately for every density evaluation, so a curve no longer needs
-to be rerun at a sequence of fixed `M_trunc` values. See
+to be rerun at a sequence of fixed `M_trunc` values. The production default is
+11 symmetric beta points from -2 through 2, including the exact beta-zero
+point. See
 `docs/ALFD_power_bound_method.md` for the formulas, interpretation of the two
 upper endpoints, target-machine timing benchmark, exact simulation-budget
 diagnostics, and the limitation of a finite grid when `m_W=3`.
