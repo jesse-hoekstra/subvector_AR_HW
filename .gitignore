@@ -1,0 +1,20 @@
+# OS / editor
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.claude
+docs 
+koev
+research_papers
+
+
+# Compiled mhg shared library (rebuild with koev/mhg15/build.sh)
+*.dylib
+*.so
+
+# Run artifacts and generated outputs
+*.log

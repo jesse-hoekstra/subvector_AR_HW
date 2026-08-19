@@ -2,7 +2,10 @@
 
 A small research helper accompanying the paper: "Best Feasible Conditional Critical Values for a More Powerful Subvector Anderson-Rubin Test", to simulate the joint distribution of the smallest two eigenvalues of a noncentral real Wishart matrix $W = X^\top X$ and to plot the empirical conditional CDF of the smallest eigenvalue given the second smallest eigenvalue for different $\\kappa$ configurations, where the approximation given in GKM represents the condititional cdf when the $p-2$ largest eigenvalues are $\infty$.
 
-This repository contains a single executable script: `simulation_plot_executable.py`.
+The original conditional-CDF executable is `simulation_plot_executable.py`.
+The repository also contains the calibrated EMW/GKM power-bound workflow in
+`alfd_eigval.py` and its finite-sample comparison plot in
+`new_power_comparison.py`.
 
 ## What it does
 
@@ -43,6 +46,32 @@ Enter the number of instruments k: 10
 ```
 An interactive Matplotlib window will open, showing:
 ![Example image for p=3 and n=10](figures/example_figure.png)
+
+## EMW power bound
+
+The corrected bound driver uses independent mixture calibration, a finite-grid
+GKM epsilon check, Monte Carlo confidence limits, and per-density adaptive
+matrix-hypergeometric truncation:
+
+```bash
+sh koev/mhg15/build.sh
+python3 alfd_eigval.py --version 1009590 --profile production --preflight-only
+python3 alfd_eigval.py --version 1009590 --profile production \
+  --benchmark-preflight --workers 8
+python3 alfd_eigval.py --version 1009590 --profile production \
+  --acknowledge-expensive
+python3 new_power_comparison.py --version 1009590 --preflight-only
+python3 new_power_comparison.py --version 1009590 --acknowledge-expensive
+```
+
+Corrected bound artifacts are written under `<version>/adaptive/`, and
+provenance-checked finite-sample caches under `<version>/dgp/`. Legacy
+`M_trunc_*` files are intentionally not loaded. Matrix-hypergeometric order is
+selected separately for every density evaluation, so a curve no longer needs
+to be rerun at a sequence of fixed `M_trunc` values. See
+`docs/ALFD_power_bound_method.md` for the formulas, interpretation of the two
+upper endpoints, target-machine timing benchmark, exact simulation-budget
+diagnostics, and the limitation of a finite grid when `m_W=3`.
 
 
 ## Inputs and configurable knobs
