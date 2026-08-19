@@ -1742,14 +1742,18 @@ def _print_simulation_budget_diagnostics(result, alpha, curve_confidence):
 
 def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
                             M_start, M_step, M_max, mhg_tol, n_workers,
-                            n_samples, benchmark_seed=MHG_BENCHMARK_SEED):
+                            n_samples, fit_grids,
+                            benchmark_seed=MHG_BENCHMARK_SEED):
     """Time a small deterministic batch of representative real p=4 pairs.
 
     The benchmark owns its ``Generator`` and exits before a production run is
     initialized, so it neither consumes production random draws nor writes an
     artifact.  Samples are genuine Xi'Xi eigenvalues from the median-trace
-    non-null alternative on the requested beta grid.  Trace quantiles from a
-    larger candidate pool reduce the noise of very small timing batches.
+    non-null alternative on the requested beta grid.  Each observation is
+    evaluated against every fitted-null density plus the alternative, matching
+    the production density-row composition.
+    Trace quantiles from a larger candidate pool reduce the noise of small
+    timing batches.
     """
     n_samples = _validated_integer("benchmark_samples", n_samples)
     n_workers = _validated_integer("n_workers", n_workers)
@@ -1776,9 +1780,16 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
     representative_index = int(
         nonnull_indices[trace_order[len(trace_order) // 2]])
     representative_omega = ncp_table[representative_index].copy()
-    representative_null = representative_omega.copy()
-    representative_null[-1] = 0.0
-    benchmark_omegas = np.vstack([representative_null, representative_omega])
+    if len(fit_grids) != betas.size:
+        raise ValueError("fit_grids must align with the benchmark beta grid")
+    fit_grid = _validated_null_grid(
+        fit_grids[representative_index], 3,
+        "benchmark fit null grid")
+    benchmark_omegas = np.vstack([
+        np.asarray([list(row) + [0.0] for row in fit_grid], dtype=float),
+        representative_omega[None],
+    ])
+    benchmark_scope = "all_fitted_null_rows_plus_alternative"
 
     # This generator is deliberately unrelated to all four production phase
     # SeedSequences.  The constant seed makes target-machine comparisons
@@ -1824,6 +1835,9 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
         logical_cpu_count=int(os.cpu_count() or 1),
         representative_beta=float(betas[representative_index]),
         representative_omega=representative_omega,
+        benchmark_scope=benchmark_scope,
+        omega_rows=int(len(benchmark_omegas)),
+        fit_null_rows=int(len(benchmark_omegas) - 1),
         sample_trace_min=float(np.min(samples.sum(axis=1))),
         sample_trace_max=float(np.max(samples.sum(axis=1))),
         samples=int(n_samples), pairs=int(benchmark_pairs),
@@ -1850,7 +1864,9 @@ def _print_mhg_benchmark(result):
           f"Omega={np.round(result['representative_omega'], 4).tolist()}")
     print(f"  sampled Xi'Xi trace range: {result['sample_trace_min']:.2f}"
           f"--{result['sample_trace_max']:.2f}")
-    print(f"  {result['samples']} samples x 2 representative Omega rows = "
+    print(f"  density-row scope: {result['benchmark_scope']} "
+          f"({result['fit_null_rows']} fitted null + 1 alternative)")
+    print(f"  {result['samples']} samples x {result['omega_rows']} Omega rows = "
           f"{result['pairs']} density pairs on {result['workers']} worker(s) "
           f"in {result['elapsed_seconds']:.2f} s: "
           f"{result['pairs_per_second']:.4f} measured pairs/s")
@@ -1927,7 +1943,8 @@ def main():
     parser.add_argument(
         '--benchmark-samples', type=int, default=None,
         help=('Xi samples for --benchmark-preflight; each is evaluated under '
-              'one rank-3 null and one full-rank Omega; defaults to 64/16/2 '
+              'all fitted-null Omega rows and the full-rank alternative; '
+              'defaults to 64/16/2 '
               'for easy/medium/strong configurations'))
     parser.add_argument(
         '--acknowledge-expensive', action='store_true',
@@ -2116,7 +2133,8 @@ def main():
         benchmark = _benchmark_adaptive_mhg(
             ncp_table, betas_alfd, total_logical_pairs, k,
             M_start, args.m_step, args.m_max, args.mhg_rtol,
-            n_workers, benchmark_samples)
+            n_workers, benchmark_samples,
+            fit_grids=[grids[0] for grids in prepared_grids])
         _print_mhg_benchmark(benchmark)
         return
 

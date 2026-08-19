@@ -124,10 +124,18 @@ class MHGTests(unittest.TestCase):
             [35.0, 25.0, 15.0, 0.0],
             [34.0, 26.0, 9.0, 3.0],
         ])
+        fit_grids = [
+            [(36.0, 26.0, 17.0), (35.0, 25.0, 15.0),
+             (20.0, 10.0, 5.0)],
+            [(35.0, 25.0, 15.0)],
+            [(34.0, 26.0, 9.0)],
+        ]
         captured_samples = []
+        captured_omegas = []
 
         def fake_batch(c, omegas, samples, **kwargs):
             captured_samples.append(np.asarray(samples).copy())
+            captured_omegas.append(np.asarray(omegas).copy())
             pairs = len(omegas) * len(samples)
             diagnostics = dict(
                 pairs=pairs, raw_evaluations=pairs,
@@ -144,16 +152,35 @@ class MHGTests(unittest.TestCase):
                 results.append(alfd._benchmark_adaptive_mhg(
                     ncp, betas, total_logical_pairs=100, k_eff=7,
                     M_start=20, M_step=20, M_max=300, mhg_tol=1e-10,
-                    n_workers=8, n_samples=2))
+                    n_workers=8, n_samples=2, fit_grids=fit_grids))
 
         np.testing.assert_array_equal(captured_samples[0], captured_samples[1])
         self.assertEqual(captured_samples[0].shape, (2, 4))
+        expected_omegas = np.array([
+            [36.0, 26.0, 17.0, 0.0],
+            [35.0, 25.0, 15.0, 0.0],
+            [20.0, 10.0, 5.0, 0.0],
+            [36.0, 26.0, 17.0, 1.0],
+        ])
+        np.testing.assert_array_equal(captured_omegas[0], expected_omegas)
+        np.testing.assert_array_equal(captured_omegas[1], expected_omegas)
         self.assertEqual(results[0]['workers'], 2)
         self.assertEqual(results[0]['configured_workers'], 8)
-        self.assertAlmostEqual(results[0]['pairs_per_second'], 2.0)
-        self.assertAlmostEqual(results[0]['measured_extrapolated_seconds'], 50.0)
-        self.assertAlmostEqual(results[0]['optimistic_configured_seconds'], 12.5)
-        self.assertEqual(results[0]['order_counts'], {90: 4})
+        self.assertEqual(results[0]['omega_rows'], 4)
+        self.assertEqual(results[0]['fit_null_rows'], 3)
+        self.assertEqual(
+            results[0]['benchmark_scope'],
+            'all_fitted_null_rows_plus_alternative')
+        self.assertAlmostEqual(results[0]['pairs_per_second'], 4.0)
+        self.assertAlmostEqual(results[0]['measured_extrapolated_seconds'], 25.0)
+        self.assertAlmostEqual(results[0]['optimistic_configured_seconds'], 6.25)
+        self.assertEqual(results[0]['order_counts'], {90: 8})
+
+        with self.assertRaisesRegex(ValueError, 'fit_grids must align'):
+            alfd._benchmark_adaptive_mhg(
+                ncp, betas, total_logical_pairs=100, k_eff=7,
+                M_start=20, M_step=20, M_max=300, mhg_tol=1e-10,
+                n_workers=1, n_samples=1, fit_grids=fit_grids[:2])
 
     def test_benchmark_cli_exits_before_artifact_writes(self):
         benchmark_result = dict(pairs=2)
@@ -178,6 +205,7 @@ class MHGTests(unittest.TestCase):
 
         run_benchmark.assert_called_once()
         self.assertEqual(run_benchmark.call_args.args[-1], 1)
+        self.assertEqual(len(run_benchmark.call_args.kwargs['fit_grids']), 1)
         print_result.assert_called_once_with(benchmark_result)
 
     def test_trailing_zero_collapse_is_not_convergence(self):
