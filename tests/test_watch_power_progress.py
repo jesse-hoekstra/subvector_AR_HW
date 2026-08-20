@@ -14,7 +14,6 @@ import numpy as np
 
 matplotlib.use("Agg")
 
-import alfd_eigval as alfd
 import new_power_comparison as comparison
 import watch_power_progress as watcher
 
@@ -63,20 +62,19 @@ def _bound_settings(beta_count):
         [35.0, 25.0, 15.0],
     ]
     return dict(
-        schema_version=alfd.RESULT_SCHEMA_VERSION,
-        algorithm=alfd.ALGORITHM_VERSION,
-        producer="alfd_eigval.py",
-        calibration_method=alfd.CALIBRATION_METHOD,
-        confidence_allocation_method=alfd.CONFIDENCE_ALLOCATION_METHOD,
+        schema_version=watcher.GKM_SCHEMA_VERSION,
+        algorithm=watcher.GKM_ALGORITHM,
+        producer=watcher.GKM_PRODUCER,
+        calibration_method=watcher.GKM_CALIBRATION_METHOD,
         version_label=VERSION,
         kappas=KAPPAS.tolist(), k=K, n=N, alpha=ALPHA,
-        curve_confidence=0.95, profile="production", beta_count=beta_count,
-        fit_grid_strategy=alfd.COMMON_GRID_METHOD,
-        pooled_importance_method=alfd.POOLED_IS_METHOD,
+        profile="production", beta_count=beta_count,
+        fit_grid_strategy=watcher.GKM_COMMON_GRID_METHOD,
+        pooled_importance_method=watcher.GKM_POOLED_IS_METHOD,
         common_grid=common_grid, grid_shapes=1, grid_strengths=2,
         grid_max_strength=100.0, grid_anchor_count=1,
-        max_active_support=2, training_bank_seed=1234,
-        audit_bank_seed=5678, source_sha256=source_hash,
+        bank_seed=1234, n_fit=2_000, n_power=50_000, n_iter=600,
+        source_sha256=source_hash,
         mhg_core_sha256=core_hash, mhg_library_sha256=library_hash,
         mhg_build_source_sha256=core_hash,
     )
@@ -87,59 +85,52 @@ def _signature(settings):
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def _save_partial_arrays(path, betas, confidence, point, benchmark):
+def _save_partial_arrays(path, betas, bounds, bounds_se):
     betas = np.asarray(betas, dtype=float)
-    confidence = np.asarray(confidence, dtype=float)
-    point = np.asarray(point, dtype=float)
-    benchmark = np.asarray(benchmark, dtype=float)
+    bounds = np.asarray(bounds, dtype=float)
+    bounds_se = np.asarray(bounds_se, dtype=float)
     settings = _bound_settings(betas.size)
     run_signature = _signature(settings)
     np.savez(
         path,
-        schema_version=np.array(alfd.RESULT_SCHEMA_VERSION),
-        algorithm=np.array(alfd.ALGORITHM_VERSION),
-        producer=np.array("alfd_eigval.py"),
-        bound_kind=np.array(alfd.BOUND_KIND),
+        schema_version=np.array(watcher.GKM_SCHEMA_VERSION),
+        algorithm=np.array(watcher.GKM_ALGORITHM),
+        producer=np.array(watcher.GKM_PRODUCER),
+        calibration_method=np.array(watcher.GKM_CALIBRATION_METHOD),
+        bound_kind=np.array(watcher.GKM_BOUND_KIND),
         version_label=np.array(VERSION),
         run_signature=np.array(run_signature),
         settings_json=np.array(json.dumps(settings, sort_keys=True)),
         kappas=KAPPAS, k=np.array(K), n=np.array(N),
-        alpha=np.array(ALPHA), curve_confidence=np.array(0.95),
-        betas=betas, bounds_confidence=confidence,
-        bounds_point=point,
-        benchmark_lower_confidence=benchmark,
+        alpha=np.array(ALPHA), betas=betas, bounds=bounds,
+        bounds_se=bounds_se,
     )
-    return betas, confidence, point, benchmark, run_signature
+    return betas, bounds, bounds_se, run_signature
 
 
 def _save_partial(path):
     return _save_partial_arrays(
         path,
         betas=[-2.0, -1.0, 0.0, 1.0, 2.0],
-        confidence=[0.13, np.nan, 0.05, np.nan, 0.20],
-        point=[0.12, np.nan, 0.05, np.nan, 0.18],
-        benchmark=[0.09, np.nan, 0.05, np.nan, 0.15],
+        bounds=[0.12, np.nan, 0.05, np.nan, 0.18],
+        bounds_se=[0.003, np.nan, 0.0, np.nan, 0.004],
     )
 
 
 def _save_final(path):
     betas = np.array([-1.0, 0.0, 1.0])
-    confidence = np.array([0.13, 0.05, 0.16])
-    point = np.array([0.12, 0.05, 0.15])
-    benchmark = np.array([0.09, 0.05, 0.12])
+    bounds = np.array([0.12, 0.05, 0.15])
+    bounds_se = np.array([0.003, 0.0, 0.004])
     settings = _bound_settings(betas.size)
     run_signature = _signature(settings)
     grid = np.asarray(settings["common_grid"], dtype=float)
     np.savez(
         path,
-        schema_version=np.array(alfd.RESULT_SCHEMA_VERSION),
-        algorithm=np.array(alfd.ALGORITHM_VERSION),
-        producer=np.array("alfd_eigval.py"),
-        calibration_method=np.array(alfd.CALIBRATION_METHOD),
-        confidence_allocation_method=np.array(
-            alfd.CONFIDENCE_ALLOCATION_METHOD),
-        bound_kind=np.array(alfd.BOUND_KIND),
-        confidence_scope=np.array("saved_beta_grid_only"),
+        schema_version=np.array(watcher.GKM_SCHEMA_VERSION),
+        algorithm=np.array(watcher.GKM_ALGORITHM),
+        producer=np.array(watcher.GKM_PRODUCER),
+        calibration_method=np.array(watcher.GKM_CALIBRATION_METHOD),
+        bound_kind=np.array(watcher.GKM_BOUND_KIND),
         density_accuracy_scope=np.array("adaptive_empirical_tail_criterion"),
         version_label=np.array(VERSION), run_signature=np.array(run_signature),
         source_sha256=np.array(settings["source_sha256"]),
@@ -148,22 +139,17 @@ def _save_final(path):
         mhg_build_source_sha256=np.array(
             settings["mhg_build_source_sha256"]),
         settings_json=np.array(json.dumps(settings, sort_keys=True)),
-        betas=betas, bounds=confidence, bounds_se=np.zeros_like(confidence),
-        bounds_point=point,
-        invariant_benchmark_lower_confidence=benchmark,
+        betas=betas, bounds=bounds, bounds_se=bounds_se,
+        mixture_power=np.array([0.13, 0.05, 0.16]),
+        mixture_power_se=np.array([0.003, 0.0, 0.004]),
+        epsilon_grid=np.array([0.01, 0.0, 0.01]),
         common_null_grid=grid, common_grid_size=np.array(grid.shape[0]),
         grid_shapes=np.array(1), grid_strengths=np.array(2),
         grid_max_strength=np.array(100.0), grid_anchor_count=np.array(1),
-        max_active_support=np.array(2),
-        active_support_count=np.array([2, 0, 2]),
-        discarded_weight_mass=np.array([0.1, 0.0, 0.05]),
-        gkm_point_upper=np.array([0.12, 0.05, 0.14]),
-        gkm_grid_lower=np.array([0.10, 0.05, 0.12]),
-        gkm_epsilon=np.array([0.02, 0.0, 0.02]),
         kappas=KAPPAS, k=np.array(K), n=np.array(N),
-        alpha=np.array(ALPHA), curve_confidence=np.array(0.95),
+        alpha=np.array(ALPHA),
     )
-    return betas, confidence, point, benchmark, run_signature
+    return betas, bounds, bounds_se, run_signature
 
 
 class DgpLoadingTests(unittest.TestCase):
@@ -201,11 +187,11 @@ class BoundProgressLoadingTests(unittest.TestCase):
             self.assertFalse(progress.is_final)
             np.testing.assert_array_equal(progress.betas, expected[0])
             np.testing.assert_array_equal(
-                np.isfinite(progress.bounds_confidence),
+                np.isfinite(progress.bounds),
                 np.array([True, False, True, False, True]))
             np.testing.assert_allclose(
-                progress.bounds_confidence[np.isfinite(
-                    progress.bounds_confidence)], [0.13, 0.05, 0.20])
+                progress.bounds[np.isfinite(progress.bounds)],
+                [0.12, 0.05, 0.18])
 
             with self.assertRaisesRegex(ValueError, "run signature"):
                 watcher.load_bound_progress(
@@ -227,11 +213,8 @@ class BoundProgressLoadingTests(unittest.TestCase):
             self.assertTrue(progress.is_final)
             self.assertEqual(progress.source_path, final)
             np.testing.assert_array_equal(progress.betas, expected[0])
-            np.testing.assert_array_equal(
-                progress.bounds_confidence, expected[1])
-            np.testing.assert_array_equal(progress.bounds_point, expected[2])
-            np.testing.assert_array_equal(
-                progress.benchmark_lower_confidence, expected[3])
+            np.testing.assert_array_equal(progress.bounds, expected[1])
+            np.testing.assert_array_equal(progress.bounds_se, expected[2])
 
     def test_newest_matching_artifact_wins_force_rerun_and_handoff_race(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -241,9 +224,8 @@ class BoundProgressLoadingTests(unittest.TestCase):
             partial_expected = _save_partial_arrays(
                 partial,
                 betas=final_expected[0],
-                confidence=[0.14, np.nan, np.nan],
-                point=[0.13, np.nan, np.nan],
-                benchmark=[0.10, np.nan, np.nan],
+                bounds=[0.13, np.nan, np.nan],
+                bounds_se=[0.003, np.nan, np.nan],
             )
             self.assertEqual(partial_expected[-1], final_expected[-1])
 
@@ -256,7 +238,7 @@ class BoundProgressLoadingTests(unittest.TestCase):
             self.assertFalse(active_rerun.is_final)
             self.assertEqual(active_rerun.source_path, partial)
             np.testing.assert_array_equal(
-                np.isfinite(active_rerun.bounds_confidence),
+                np.isfinite(active_rerun.bounds),
                 [True, False, False])
 
             os.utime(final, ns=(timestamp + 2_000_000,)*2)
@@ -266,7 +248,7 @@ class BoundProgressLoadingTests(unittest.TestCase):
             self.assertTrue(completed_handoff.is_final)
             self.assertEqual(completed_handoff.source_path, final)
             np.testing.assert_array_equal(
-                completed_handoff.bounds_confidence, final_expected[1])
+                completed_handoff.bounds, final_expected[1])
 
     def test_partial_deleted_during_handoff_returns_loaded_final(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -276,9 +258,8 @@ class BoundProgressLoadingTests(unittest.TestCase):
             partial_expected = _save_partial_arrays(
                 partial,
                 betas=final_expected[0],
-                confidence=[0.14, np.nan, np.nan],
-                point=[0.13, np.nan, np.nan],
-                benchmark=[0.10, np.nan, np.nan],
+                bounds=[0.13, np.nan, np.nan],
+                bounds_se=[0.003, np.nan, np.nan],
             )
             self.assertEqual(partial_expected[-1], final_expected[-1])
 
@@ -300,7 +281,7 @@ class BoundProgressLoadingTests(unittest.TestCase):
             self.assertTrue(progress.is_final)
             self.assertEqual(progress.source_path, final)
             np.testing.assert_array_equal(
-                progress.bounds_confidence, final_expected[1])
+                progress.bounds, final_expected[1])
 
 
 class PlotTests(unittest.TestCase):
@@ -330,7 +311,7 @@ class PlotTests(unittest.TestCase):
             self.assertEqual(
                 [line.get_label() for line in axes.lines],
                 [r"$\chi^2$", r"$c_1$", r"$c_3$",
-                 "EMW upper bound (95% simultaneous confidence)",
+                 r"GKM power bound ($m_W=3$)",
                  r"$\alpha=0.05$"])
             self.assertEqual(len(axes.collections), 0)
             self.assertEqual(len(axes.texts), 0)
@@ -342,17 +323,11 @@ class PlotTests(unittest.TestCase):
                     and np.array_equal(y, curve)
                     for x, y in line_data))
 
-            complete = np.isfinite(progress.bounds_confidence)
+            complete = np.isfinite(progress.bounds)
             self.assertTrue(any(
                 np.array_equal(x, progress.betas[complete])
-                and np.array_equal(y, progress.bounds_confidence[complete])
+                and np.array_equal(y, progress.bounds[complete])
                 for x, y in line_data))
-            self.assertFalse(any(
-                np.array_equal(y, progress.bounds_point[complete])
-                for _, y in line_data))
-            self.assertFalse(any(
-                np.array_equal(y, progress.benchmark_lower_confidence[complete])
-                for _, y in line_data))
             self.assertEqual(metrics["completed_beta_count"], 3)
 
     def test_png_publish_is_atomic_and_preserves_old_file_on_render_failure(self):
@@ -386,7 +361,7 @@ class PlotTests(unittest.TestCase):
             all_nan = np.full(3, np.nan)
             _save_partial_arrays(
                 partial_path, betas=[-1.0, 0.0, 1.0],
-                confidence=all_nan, point=all_nan, benchmark=all_nan)
+                bounds=all_nan, bounds_se=all_nan)
             dgp = watcher.load_dgp_curves(VERSION, dgp_path)
             progress = watcher.load_bound_progress(
                 VERSION, partial_path=partial_path,
@@ -448,13 +423,10 @@ class CsvTests(unittest.TestCase):
 
             expected_series = {
                 "power_chi2", "power_c1", "power_cp1",
-                "bounds_confidence", "bounds_point",
-                "benchmark_lower_confidence",
-                "power_cp1_interpolated_at_bound_beta",
-                "bounds_confidence_minus_power_cp1",
+                "gkm_power_bound",
             }
             self.assertEqual({row["series"] for row in rows}, expected_series)
-            self.assertEqual(len(rows), 40)
+            self.assertEqual(len(rows), 20)
             self.assertTrue(all(
                 row["dgp_run_signature"] == dgp.run_signature
                 for row in rows))
@@ -465,16 +437,10 @@ class CsvTests(unittest.TestCase):
                 row["synthetic_demo"] == "false" for row in rows))
             self.assertEqual(
                 {row["scope"] for row in rows},
-                {"finite_sample_dgp", "limit_experiment",
-                 "cross_experiment_diagnostic"})
+                {"finite_sample_dgp", "limit_experiment"})
 
-            blank_when_incomplete = {
-                "bounds_confidence", "bounds_point",
-                "benchmark_lower_confidence",
-                "bounds_confidence_minus_power_cp1",
-            }
             incomplete = [row for row in rows
-                          if row["series"] in blank_when_incomplete
+                          if row["series"] == "gkm_power_bound"
                           and row["completed"] == "false"]
             self.assertTrue(incomplete)
             self.assertTrue(all(row["value"] == "" for row in incomplete))
@@ -522,12 +488,12 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(fake_run.finish.call_count, 1)
         init = fake_wandb.init.call_args.kwargs
         self.assertEqual(init["project"], "demo-project")
-        self.assertTrue(init["id"].startswith("emw-demo-"))
+        self.assertTrue(init["id"].startswith("gkm-demo-"))
         self.assertIn("[SYNTHETIC DEMO]", init["name"])
         self.assertTrue(init["config"]["synthetic_demo"])
         self.assertEqual(init["config"]["dgp_cache"], "<synthetic-demo>")
 
-        expected_directory = os.path.join(VERSION, "adaptive", "demo")
+        expected_directory = os.path.join(VERSION, "gkm_direct", "demo")
         png_paths = [call.args[2] for call in write_plot.call_args_list]
         csv_paths = [call.args[2] for call in write_values.call_args_list]
         self.assertTrue(all(
@@ -559,6 +525,53 @@ class DemoTests(unittest.TestCase):
 
 
 class WandbFailureTests(unittest.TestCase):
+    def test_final_snapshot_retries_until_upload_succeeds(self):
+        betas = np.array([-1.0, 0.0, 1.0])
+        settings = dict(
+            version_label=VERSION, kappas=KAPPAS.tolist(),
+            k=K, n=N, alpha=ALPHA)
+        dgp = watcher.DgpCurves(
+            betas=betas,
+            power_chi2=np.array([0.06, 0.05, 0.07]),
+            power_c1=np.array([0.07, 0.05, 0.08]),
+            power_cp1=np.array([0.08, 0.05, 0.09]),
+            settings=settings, run_signature="d" * 64, path="dgp.npz")
+        progress = watcher.BoundProgress(
+            betas=betas, bounds=np.array([0.10, 0.05, 0.11]),
+            bounds_se=np.array([0.01, 0.0, 0.01]),
+            run_signature="b" * 64, source_path="bound.npz",
+            is_final=True, settings=settings)
+        logger = types.SimpleNamespace(
+            requested=True, start=mock.Mock(),
+            log=mock.Mock(side_effect=[False, True]), finish=mock.Mock())
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(
+                    watcher, "WandbLogger", return_value=logger), \
+                mock.patch.object(
+                    watcher, "load_dgp_curves", return_value=dgp), \
+                mock.patch.object(
+                    watcher, "load_bound_progress",
+                    return_value=progress) as load_progress, \
+                mock.patch.object(
+                    watcher, "write_progress_plot",
+                    return_value={"completed_beta_count": 3,
+                                  "total_beta_count": 3,
+                                  "below_c3_count": 0}), \
+                mock.patch.object(watcher, "write_progress_values"), \
+                mock.patch.object(watcher.time, "sleep"), \
+                mock.patch("builtins.print"):
+            watcher.main([
+                "--version", VERSION,
+                "--output", os.path.join(directory, "progress.png"),
+                "--wandb-project", "test-project",
+                "--poll-seconds", "0.001",
+            ])
+
+        self.assertEqual(load_progress.call_count, 2)
+        self.assertEqual(logger.log.call_count, 2)
+        logger.finish.assert_called_once()
+
     def test_upload_failure_does_not_prevent_local_png(self):
         class FailingRun:
             def __init__(self):
@@ -626,7 +639,7 @@ class WandbFailureTests(unittest.TestCase):
         messages = " ".join(
             " ".join(str(arg) for arg in call.args)
             for call in printed.call_args_list)
-        self.assertIn("next checkpoint will retry", messages)
+        self.assertIn("next watcher poll will retry", messages)
 
 
 if __name__ == "__main__":

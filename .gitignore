@@ -28,3 +28,5 @@ wandb/
 **/adaptive/live_power_progress_*.png
 **/adaptive/live_power_progress_*.csv
 **/adaptive/demo/
+**/dgp/
+**/gkm_direct/

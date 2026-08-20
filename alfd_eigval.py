@@ -8,10 +8,11 @@ standalone C port of Koev's mhg.c directly from Python (ctypes) — no MATLAB or
 Octave required.
 
 The calculation bounds tests measurable with respect to the ordered eigenvalue
-vector (the invariant class studied in the reference application).  The code
-implements EMW's mandatory post-weight mixture calibration, an independent GKM
-finite-grid tightening check, Monte Carlo confidence limits, and per-density
-adaptive hypergeometric truncation.
+vector (the invariant class studied in the reference application).  It is a
+direct m_W=3 extension of the GKM Supplement D.3.2 implementation of EMW:
+one pooled ordinary-importance-sampling null bank, the fixed EMW weight update,
+the Step-6 mixture calibration, and the Step-8/9 grid adjustment.  Numerical
+matrix-hypergeometric truncation remains adaptive for every density pair.
 
 Setup (one-time):
     # Koev's mhg15 package lives in ~/Oxford/subvector_AR_HW/koev/mhg15/
@@ -27,7 +28,6 @@ Run:
 
 import os
 import sys
-import gc
 import time
 import json
 import math
@@ -38,11 +38,8 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 import scipy
-import matplotlib.pyplot as plt
 from scipy.linalg import inv, sqrtm
 from scipy.special import logsumexp
-from scipy.stats import beta as beta_distribution
-from scipy.stats import chi2
 
 
 # ============================================================
@@ -52,13 +49,13 @@ from scipy.stats import chi2
 # no longer a numerical result that users have to tune by rerunning a curve.
 # ============================================================
 
-RESULT_SCHEMA_VERSION = 3
-ALGORITHM_VERSION = "emw_eigval_gkm_is_adaptive_v3"
-CALIBRATION_METHOD = "independent_mixture_quantile"
-BOUND_KIND = "simultaneous_mc_confidence_upper_conditional_on_density_accuracy"
+RESULT_SCHEMA_VERSION = 4
+ALGORITHM_VERSION = "gkm_eigval_mw3_adaptive_v4"
+CALIBRATION_METHOD = "gkm_step6_reused_pooled_bank"
+BOUND_KIND = "gkm_d3_2_grid_adjusted_mc_power_bound"
 COMMON_GRID_METHOD = "strength_shape_3d_v1"
 POOLED_IS_METHOD = "gkm_stratified_equal_null_mixture_v1"
-CONFIDENCE_ALLOCATION_METHOD = "two_event_upper_separate_two_event_grid_v1"
+GRID_DESIGN_BETA_COUNT = 81
 
 ALLOWED_CONFIGS = {
     (35, 25, 15): dict(
@@ -790,80 +787,6 @@ def log_eigval_density_partial(S_batch, Omegas, c, M_trunc=20,
 # Null grid (lean: alt-nuisance + a few standard points)
 # ============================================================
 
-def lean_null_grid(alt_nuisance, standard_points, n_perturb=4,
-                  perturb_sd=1.5, seed=0):
-    """
-    Compact null grid: alt-nuisance + config-specific standard points + random
-    perturbations of alt-nuisance. The perturbations improve tightness when the
-    least-favorable support lies near the alternative nuisance values. A sparse
-    support does not invalidate the separately calibrated EMW upper endpoint;
-    it can only make that endpoint loose.
-
-    standard_points : list of (k1, k2, k3) tuples appropriate to the kappa
-                      configuration (so coverage is at the right scale).
-    """
-    alt_arr = np.asarray(alt_nuisance, dtype=float)
-    alt = tuple(sorted(alt_arr, reverse=True))
-    grid = [alt] + [tuple(float(x) for x in sp) for sp in standard_points]
-    rng = np.random.default_rng(seed)
-    for _ in range(n_perturb):
-        eps = rng.normal(0.0, perturb_sd, size=len(alt_arr))
-        pert = tuple(sorted([max(0.5, a + e) for a, e in zip(alt_arr, eps)],
-                            reverse=True))
-        grid.append(pert)
-    # De-duplicate (round-to-4dp keys)
-    seen, out = set(), []
-    for g in grid:
-        key = tuple(round(x, 4) for x in g)
-        if key not in seen:
-            seen.add(key)
-            out.append(g)
-    return out
-
-
-def validation_null_grid(fit_grid, alt_nuisance, standard_points,
-                         n_points=32, max_strength=None, seed=81723):
-    """Build a deterministic, broader grid for the GKM size check.
-
-    For ``m_W=3`` the null nuisance space is an unbounded ordered cone, so no
-    finite grid alone proves global size control.  This grid covers the fit
-    support, boundary faces, rays and log-spread interior points.  The result
-    is explicitly reported as a *finite-grid* certificate.
-    """
-    dim = len(alt_nuisance)
-    base = [tuple(float(x) for x in row) for row in fit_grid]
-    base += [tuple(float(x) for x in row) for row in standard_points]
-    if max_strength is None:
-        largest = max([1.0] + [max(row) for row in base]
-                      + [float(np.max(alt_nuisance))])
-        max_strength = max(100.0, 2.0 * largest)
-    max_strength = float(max_strength)
-
-    target_points = max(int(n_points), len(fit_grid))
-    candidates = list(base)
-    candidates.append(tuple(0.0 for _ in range(dim)))
-    levels = np.expm1(np.linspace(0.0, np.log1p(max_strength), 7))[1:]
-    for level in levels:
-        for rank in range(1, dim + 1):
-            candidates.append(tuple([float(level)] * rank
-                                    + [0.0] * (dim - rank)))
-
-    rng = np.random.default_rng(seed)
-    while len(candidates) < max(target_points * 2, target_points + 8):
-        draw = np.expm1(rng.uniform(0.0, np.log1p(max_strength), size=dim))
-        candidates.append(tuple(np.sort(draw)[::-1]))
-
-    seen = set()
-    result = []
-    for row in candidates:
-        ordered = tuple(sorted((max(0.0, float(x)) for x in row), reverse=True))
-        key = tuple(round(x, 8) for x in ordered)
-        if key not in seen:
-            seen.add(key)
-            result.append(ordered)
-        if len(result) >= target_points:
-            break
-    return result
 
 
 def common_null_grid_3d(alt_nuisance_rows, config_kappas, standard_points=None,
@@ -1001,6 +924,7 @@ class TailRule:
 @dataclass
 class EMWFitResult:
     weights: np.ndarray
+    log_weights: np.ndarray
     mu: np.ndarray
     rejection_probabilities: np.ndarray
     training_rule: TailRule
@@ -1036,39 +960,28 @@ class PooledISBank:
 
 
 @dataclass
-class ALFDBoundResult:
-    upper_point: float
-    upper_point_se: float
-    upper_confidence: float
-    lower_grid_point: float
-    lower_grid_confidence: float
-    epsilon_grid_point: float
-    epsilon_grid_confidence: float
-    confidence_level: float
+class GKMDirectResult:
+    r"""Outputs of GKM Supplement D.3.2 Steps 5--9 for one alternative.
+
+    ``mixture_power`` is :math:`\bar\pi` from Step 7.  ``bound`` is the
+    grid-adjusted :math:`\tilde\pi` from Step 9, the quantity GKM use as the
+    point-optimal power bound in their Figure 3.  Both are Monte Carlo point
+    estimates, not confidence endpoints.
+    """
+    bound: float
+    bound_se: float
+    mixture_power: float
+    mixture_power_se: float
+    epsilon_grid: float
     weights: np.ndarray
+    log_weights: np.ndarray
     fit_rejection_probabilities: np.ndarray
-    fit_complementarity_residual: float
-    fit_converged: bool
+    grid_rejection_probabilities: np.ndarray
     fit_iterations: int
-    point_rule: TailRule
-    upper_confidence_rule: TailRule
-    lower_grid_rule: TailRule
-    lower_grid_confidence_rule: TailRule
-    calibration_component_counts: np.ndarray
-    validation_rejection_probabilities: np.ndarray
-    invariant_benchmark_power: float
-    invariant_benchmark_se: float
-    invariant_benchmark_lower_confidence: float
+    mixture_rule: TailRule
+    grid_rule: TailRule
+    importance_diagnostics: dict
     mhg_diagnostics: dict
-    full_weights: np.ndarray = None
-    active_indices: np.ndarray = None
-    active_null_grid: np.ndarray = None
-    discarded_weight_mass: float = 0.0
-    gkm_point_upper: float = np.nan
-    gkm_grid_lower: float = np.nan
-    gkm_epsilon: float = np.nan
-    importance_diagnostics: dict = None
-    grid_bracket_confidence_level: float = np.nan
 
 
 def _softmax(x):
@@ -1090,40 +1003,6 @@ def tail_rejection_probabilities(scores, rule):
             + rule.tie_probability * (scores == rule.threshold))
 
 
-def calibrate_weighted_tail(scores, sample_weights, alpha,
-                            method="weighted_empirical_exact"):
-    """Calibrate ``1{S>c}+rho*1{S=c}`` to exact weighted empirical size."""
-    scores = np.asarray(scores, dtype=float).ravel()
-    weights = np.asarray(sample_weights, dtype=float).ravel()
-    if scores.size == 0 or scores.shape != weights.shape:
-        raise ValueError("scores and sample_weights must be nonempty and aligned")
-    if not np.all(np.isfinite(scores)) or not np.all(np.isfinite(weights)):
-        raise ValueError("calibration scores and weights must be finite")
-    if np.any(weights < 0.0) or not (0.0 < alpha < 1.0):
-        raise ValueError("weights must be nonnegative and 0 < alpha < 1")
-    total_weight = float(weights.sum())
-    if total_weight <= 0.0:
-        raise ValueError("sample weights must have positive mass")
-    weights = weights / total_weight
-    target = float(alpha)
-
-    order = np.argsort(scores, kind="mergesort")[::-1]
-    sorted_scores = scores[order]
-    sorted_weights = weights[order]
-    above = 0.0
-    i = 0
-    while i < scores.size:
-        j = i + 1
-        while j < scores.size and sorted_scores[j] == sorted_scores[i]:
-            j += 1
-        tie_mass = float(sorted_weights[i:j].sum())
-        if above <= target + 1e-15 and target <= above + tie_mass + 1e-15:
-            rho = float(np.clip((target - above) / tie_mass, 0.0, 1.0))
-            empirical = above + rho * tie_mass
-            return TailRule(float(sorted_scores[i]), rho, float(empirical), method)
-        above += tie_mass
-        i = j
-    raise RuntimeError("failed to locate weighted tail quantile")
 
 
 def calibrate_raw_weighted_tail(scores, raw_contributions, alpha,
@@ -1160,7 +1039,11 @@ def calibrate_raw_weighted_tail(scores, raw_contributions, alpha,
         tie_mass = float(sorted_weights[i:j].sum())
         if above <= alpha + 1e-15 and alpha <= above + tie_mass + 1e-15:
             if tie_mass <= 0.0:
-                raise RuntimeError("zero-mass tie cannot attain raw alpha")
+                if np.isclose(above, alpha, rtol=0.0, atol=1e-15):
+                    return TailRule(float(sorted_scores[i]), 0.0,
+                                    float(above), method)
+                i = j
+                continue
             rho = float(np.clip((alpha - above) / tie_mass, 0.0, 1.0))
             return TailRule(float(sorted_scores[i]), rho,
                             float(above + rho * tie_mass), method)
@@ -1202,7 +1085,7 @@ def _validate_pooled_is_bank(bank):
             or np.any(eigs < -1e-10) or np.any(np.diff(eigs, axis=1) > 1e-8)
             or np.any(strata < 0) or np.any(strata >= H)
             or bank.sampling_scheme != "stratified_null_gkm_is"
-            or bank.role not in ("training", "audit")
+            or bank.role != "gkm"
             or not isinstance(bank.bank_id, str) or not bank.bank_id):
         raise ValueError("invalid pooled GKM importance-sampling bank")
     expected_base = np.full(N, 1.0 / N)
@@ -1311,340 +1194,78 @@ def common_grid_raw_is_tail_rule(scores, raw_target_contributions, alpha,
                     "gkm_grid_ordinary_is_size_at_most_alpha")
 
 
-def calibrate_empirical_tail(scores, alpha, method="empirical_exact"):
-    scores = np.asarray(scores, dtype=float).ravel()
-    if scores.size == 0:
-        raise ValueError("calibration scores must be nonempty")
-    return calibrate_weighted_tail(
-        scores, np.full(scores.size, 1.0 / scores.size), alpha, method=method)
 
 
-def _liberal_tail_rejection_count(n, alpha, delta):
-    """Calibration observations rejected by the confidence-liberal rule.
 
-    This is the smallest ``q`` for which
-    ``P{Binomial(n, alpha) >= q} <= delta``.  Keeping the rank calculation in
-    one helper ensures that preflight reports exactly the rule used later.
+
+def fit_gkm_weights_is(bank, log_g, alpha=0.05, n_iter=600,
+                       step_size=2.0, active_weight_tol=1e-12):
+    """Run GKM Supplement D.3.2 Step 5 without algorithmic additions.
+
+    GKM initialize every coordinate of ``mu`` at -2, use the fixed scalar
+    step ``omega=2``, and perform exactly ``O=600`` updates.  In particular,
+    this implementation has no sign-switch damping, early stopping, or
+    best-iterate selection.  ``n_iter`` remains configurable for plumbing
+    tests, but reportable runs use 600.
     """
-    n = _validated_integer("n", n, minimum=2)
-    if not (0.0 < alpha < 1.0) or not (0.0 < delta < 1.0):
-        raise ValueError("alpha and delta must lie in (0,1)")
-    r = np.arange(n, dtype=int)
-    cdf_at_alpha = beta_distribution.cdf(alpha, r + 1, n - r)
-    valid = np.flatnonzero(cdf_at_alpha <= delta)
-    if valid.size == 0:
-        raise ValueError(
-            f"n_calibration={n} is too small for alpha={alpha} and "
-            f"delta={delta}; increase n_calibration or relax the confidence "
-            "level")
-    return int(valid[0] + 1)
-
-
-def _conservative_tail_rejection_count(n, alpha, delta):
-    """Validation observations rejected by the confidence-conservative rule.
-
-    This is the largest ``r`` for which
-    ``P{Binomial(n, alpha) <= r} <= delta``.
-    """
-    n = _validated_integer("n", n, minimum=2)
-    if not (0.0 < alpha < 1.0) or not (0.0 < delta < 1.0):
-        raise ValueError("alpha and delta must lie in (0,1)")
-    candidate = np.arange(n, dtype=int)
-    cdf_at_alpha = beta_distribution.cdf(
-        alpha, candidate + 1, n - candidate)
-    valid = np.flatnonzero(cdf_at_alpha >= 1.0 - delta)
-    if valid.size == 0:
-        raise ValueError(
-            f"n_validation={n} is too small for alpha={alpha} and "
-            f"delta={delta}; increase n_validation or relax the confidence "
-            "level")
-    return int(valid[-1])
-
-
-def confidence_liberal_tail_rule(scores, alpha, delta):
-    """Distribution-free order-statistic rule with true tail >= alpha.
-
-    Conditional on a fitted mixture and independent iid calibration scores,
-    this deliberately chooses a slightly liberal LR cutoff.  With probability
-    at least ``1-delta`` its population mixture size is at least ``alpha``;
-    its alternative power therefore remains above the level-alpha NP envelope.
-    """
-    scores = np.asarray(scores, dtype=float).ravel()
-    if not np.all(np.isfinite(scores)) or not (0.0 < alpha < 1.0):
-        raise ValueError("scores must be finite and 0 < alpha < 1")
-    scores = np.sort(scores)
-    N = scores.size
-    if N < 2 or not (0.0 < delta < 1.0):
-        raise ValueError("need at least two scores and 0 < delta < 1")
-    # q includes the selected order statistic because the cutoff is moved one
-    # representable float downward.  Before that move, q-1 observations are
-    # strictly above it.
-    q = _liberal_tail_rejection_count(N, alpha, delta)
-    n_above = q - 1
-    index = N - n_above - 1
-    # Lower by one representable float so every observation tied at the order
-    # statistic is included; this is conservative if numerical ties occur.
-    threshold = float(np.nextafter(scores[index], -np.inf))
-    empirical = float(np.mean(scores > threshold))
-    return TailRule(threshold, 0.0, empirical,
-                    "order_statistic_mixture_size_at_least_alpha")
-
-
-def confidence_conservative_tail_rule(scores, alpha, delta):
-    """Order-statistic rule with true tail <= alpha with confidence 1-delta."""
-    scores = np.asarray(scores, dtype=float).ravel()
-    if not np.all(np.isfinite(scores)) or not (0.0 < alpha < 1.0):
-        raise ValueError("scores must be finite and 0 < alpha < 1")
-    scores = np.sort(scores)
-    N = scores.size
-    if N < 2 or not (0.0 < delta < 1.0):
-        raise ValueError("need at least two scores and 0 < delta < 1")
-    n_above = _conservative_tail_rejection_count(N, alpha, delta)
-    index = N - n_above - 1
-    # Raise by one representable float so ties are excluded conservatively.
-    threshold = float(np.nextafter(scores[index], np.inf))
-    empirical = float(np.mean(scores > threshold))
-    return TailRule(threshold, 0.0, empirical,
-                    "order_statistic_null_size_at_most_alpha")
-
-
-def clopper_pearson(count, n, delta, side):
-    """One-sided exact binomial confidence limit."""
-    count, n = int(count), int(n)
-    if not (0 <= count <= n) or not (0.0 < delta < 1.0):
-        raise ValueError("invalid binomial confidence-limit arguments")
-    if side == "upper":
-        return 1.0 if count == n else float(
-            beta_distribution.ppf(1.0 - delta, count + 1, n - count))
-    if side == "lower":
-        return 0.0 if count == 0 else float(
-            beta_distribution.ppf(delta, count, n - count + 1))
-    raise ValueError("side must be 'lower' or 'upper'")
-
-
-def common_grid_tail_rule(score_rows, alpha, minimum_rule=None,
-                          method="grid_empirical_size_at_most_alpha"):
-    """Smallest common empirical rule controlling every supplied null row."""
-    rows = np.asarray(score_rows, dtype=float)
-    if (rows.ndim != 2 or rows.shape[0] == 0 or rows.shape[1] == 0
-            or not np.all(np.isfinite(rows)) or not (0.0 < alpha < 1.0)):
-        raise ValueError(
-            "score_rows must be a nonempty finite matrix and 0 < alpha < 1")
-    individual = [calibrate_empirical_tail(row, alpha) for row in rows]
-    threshold = max(rule.threshold for rule in individual)
-    if minimum_rule is not None:
-        threshold = max(threshold, minimum_rule.threshold)
-
-    allowed_rho = 1.0
-    for row in rows:
-        above = float(np.mean(row > threshold))
-        tied = float(np.mean(row == threshold))
-        if above > alpha + 1e-12:
-            raise RuntimeError("common grid threshold failed empirical size control")
-        if tied > 0.0:
-            allowed_rho = min(allowed_rho, max(0.0, (alpha - above) / tied))
-    if minimum_rule is not None and threshold == minimum_rule.threshold:
-        allowed_rho = min(allowed_rho, minimum_rule.tie_probability)
-    rule = TailRule(float(threshold), float(np.clip(allowed_rho, 0.0, 1.0)),
-                    np.nan, method)
-    max_size = max(float(np.mean(tail_rejection_probabilities(row, rule)))
-                   for row in rows)
-    return TailRule(rule.threshold, rule.tie_probability, max_size, rule.method)
-
-
-def fit_emw_weights(log_f, log_g, alpha=0.05, n_iter=600,
-                    initial_step=2.0, min_step=0.01,
-                    active_weight_tol=1e-6, convergence_tol=None,
-                    convergence_patience=10):
-    """Fit finite-grid EMW weights, with sign-switch step damping.
-
-    The update direction and initial factor are EMW equation (10).  Damping a
-    coordinate after a sign switch prevents the deterministic empirical
-    staircase from cycling forever.  The returned weights are always followed
-    by a separate independent critical-value calibration.
-    """
-    log_f = np.asarray(log_f, dtype=float)
-    log_g = np.asarray(log_g, dtype=float)
-    if log_f.ndim != 3 or log_g.shape != log_f.shape[1:]:
-        raise ValueError("expected log_f (G,G,N) and log_g (G,N)")
-    G, G_samples, n_per_null = log_f.shape
-    if G != G_samples or not np.all(np.isfinite(log_f)) or not np.all(np.isfinite(log_g)):
-        raise ValueError("training density arrays are invalid")
-    if convergence_tol is None:
-        convergence_tol = max(2.0 / n_per_null, 5e-4)
-
-    mu = np.full(G, -2.0)
-    steps = np.full(G, float(initial_step))
-    previous_sign = np.zeros(G)
-    best = None
-    stable = 0
-
-    for iteration in range(1, int(n_iter) + 1):
-        log_threshold = logsumexp(mu[:, None, None] + log_f, axis=0)
-        rejection = (log_g > log_threshold).astype(float)
-        rp = rejection.mean(axis=1)
-        error = rp - alpha
-        weights = _softmax(mu)
-        active = weights > active_weight_tol
-        active_residual = (float(np.max(np.abs(error[active])))
-                           if np.any(active) else 0.0)
-        slack_residual = float(np.max(np.maximum(error[~active], 0.0))) \
-            if np.any(~active) else 0.0
-        residual = max(active_residual, slack_residual)
-        if best is None or residual < best[0]:
-            best = (residual, mu.copy(), rp.copy(), iteration)
-
-        if residual <= convergence_tol:
-            stable += 1
-            if stable >= convergence_patience:
-                break
-        else:
-            stable = 0
-
-        sign = np.sign(error)
-        switched = (previous_sign != 0.0) & (sign != 0.0) & (sign != previous_sign)
-        steps[switched] = np.maximum(min_step, 0.5 * steps[switched])
-        mu = mu + steps * error
-        previous_sign = sign
-
-    _, best_mu, _, best_iteration = best
-    weights = _softmax(best_mu)
-
-    # Diagnose complementarity after the mandatory normalized-mixture
-    # calibration (the raw pre-update RP from the old code was meaningless).
-    log_mix = logsumexp(
-        _log_probability_weights(weights)[:, None, None] + log_f, axis=0)
-    scores = log_g - log_mix
-    observation_weights = np.repeat(weights / n_per_null, n_per_null)
-    training_rule = calibrate_weighted_tail(
-        scores.reshape(-1), observation_weights, alpha,
-        method="training_weighted_mixture_exact")
-    rp = np.mean(tail_rejection_probabilities(scores, training_rule), axis=1)
-    active = weights > active_weight_tol
-    active_residual = float(np.max(np.abs(rp[active] - alpha))) \
-        if np.any(active) else 0.0
-    slack_residual = float(np.max(np.maximum(rp[~active] - alpha, 0.0))) \
-        if np.any(~active) else 0.0
-    residual = max(active_residual, slack_residual)
-    return EMWFitResult(
-        weights=weights, mu=best_mu, rejection_probabilities=rp,
-        training_rule=training_rule, iterations=best_iteration,
-        converged=bool(residual <= convergence_tol),
-        complementarity_residual=float(residual))
-
-
-def fit_emw_weights_is(bank, log_g, alpha=0.05, n_iter=600,
-                       initial_step=2.0, min_step=0.01,
-                       active_weight_tol=1e-6, convergence_tol=None,
-                       convergence_patience=10):
-    """Fit EMW weights with GKM's pooled ordinary importance sampler."""
     H, N = _validate_pooled_is_bank(bank)
     log_g = np.asarray(log_g, dtype=float).ravel()
-    if log_g.shape != (N,) or not np.all(np.isfinite(log_g)):
-        raise ValueError("log_g must be finite and aligned with the pooled bank")
     n_iter = _validated_integer("n_iter", n_iter)
-    convergence_patience = _validated_integer(
-        "convergence_patience", convergence_patience)
-    numeric_parameters = np.asarray(
-        [alpha, initial_step, min_step, active_weight_tol], dtype=float)
-    if (not np.all(np.isfinite(numeric_parameters))
-            or not (0.0 < alpha < 1.0)
-            or initial_step <= 0.0 or min_step <= 0.0
-            or min_step > initial_step
+    numeric = np.asarray([alpha, step_size, active_weight_tol], dtype=float)
+    if (log_g.shape != (N,) or not np.all(np.isfinite(log_g))
+            or not np.all(np.isfinite(numeric))
+            or not (0.0 < alpha < 1.0) or step_size <= 0.0
             or not (0.0 <= active_weight_tol < 1.0)):
-        raise ValueError("invalid EMW fit parameters")
-    ratios = _pooled_is_ratios(bank)
-    max_contribution = float(np.max(ratios * bank.base_weights[None, :]))
-    if convergence_tol is None:
-        convergence_tol = max(2.0 * max_contribution, 5e-4)
-    elif (not np.isfinite(convergence_tol)) or convergence_tol <= 0.0:
-        raise ValueError("convergence_tol must be finite and positive")
+        raise ValueError("invalid direct-GKM fit inputs")
 
+    ratios = _pooled_is_ratios(bank)
     mu = np.full(H, -2.0)
-    steps = np.full(H, float(initial_step))
-    previous_sign = np.zeros(H)
-    best = None
-    stable = 0
-    for iteration in range(1, n_iter + 1):
+    for _ in range(n_iter):
         log_threshold = logsumexp(mu[:, None] + bank.log_f, axis=0)
         rejection = (log_g > log_threshold).astype(float)
         rp = ratios @ (bank.base_weights * rejection)
-        error = rp - alpha
-        weights = _softmax(mu)
-        active = weights > active_weight_tol
-        active_residual = (float(np.max(np.abs(error[active])))
-                           if np.any(active) else 0.0)
-        slack_residual = (float(np.max(np.maximum(error[~active], 0.0)))
-                          if np.any(~active) else 0.0)
-        residual = max(active_residual, slack_residual)
-        if best is None or residual < best[0]:
-            best = (residual, mu.copy(), iteration)
-        if residual <= convergence_tol:
-            stable += 1
-            if stable >= convergence_patience:
-                break
-        else:
-            stable = 0
-        sign = np.sign(error)
-        switched = ((previous_sign != 0.0) & (sign != 0.0)
-                    & (sign != previous_sign))
-        steps[switched] = np.maximum(min_step, 0.5 * steps[switched])
-        mu = mu + steps * error
-        previous_sign = sign
+        mu += float(step_size) * (rp - alpha)
 
-    _, best_mu, best_iteration = best
-    weights = _softmax(best_mu)
+    # Keep the normalized weights in log form for every likelihood-ratio
+    # calculation.  With 600 fixed updates, a mathematically positive GKM
+    # weight can be smaller than the least representable float; exponentiating
+    # it must not silently remove that null row from the mixture.
+    log_weights = mu - logsumexp(mu)
+    weights = np.exp(log_weights)
     log_mix = logsumexp(
-        _log_probability_weights(weights)[:, None] + bank.log_f, axis=0)
+        log_weights[:, None] + bank.log_f, axis=0)
     scores = log_g - log_mix
-    mix_contributions = bank.base_weights * np.exp(log_mix - bank.log_q)
-    training_rule = calibrate_raw_weighted_tail(
-        scores, mix_contributions, alpha,
-        method="gkm_training_mixture_ordinary_is")
-    rejection = tail_rejection_probabilities(scores, training_rule)
+    mixture_contributions = (
+        bank.base_weights * np.exp(log_mix - bank.log_q))
+    mixture_rule = calibrate_raw_weighted_tail(
+        scores, mixture_contributions, alpha,
+        method="gkm_step6_mixture_ordinary_is")
+    rejection = tail_rejection_probabilities(scores, mixture_rule)
     rp = ratios @ (bank.base_weights * rejection)
+
+    # This is a diagnostic only; GKM always use the O-th iterate.
     active = weights > active_weight_tol
     active_residual = (float(np.max(np.abs(rp[active] - alpha)))
                        if np.any(active) else 0.0)
     slack_residual = (float(np.max(np.maximum(rp[~active] - alpha, 0.0)))
                       if np.any(~active) else 0.0)
     residual = max(active_residual, slack_residual)
+    max_contribution = float(np.max(
+        ratios * bank.base_weights[None, :]))
+    diagnostic_tolerance = max(2.0 * max_contribution, 5e-4)
     return EMWFitResult(
-        weights=weights, mu=best_mu, rejection_probabilities=rp,
-        training_rule=training_rule, iterations=best_iteration,
-        converged=bool(residual <= convergence_tol),
+        weights=weights, log_weights=log_weights, mu=mu,
+        rejection_probabilities=rp,
+        training_rule=mixture_rule, iterations=n_iter,
+        converged=bool(residual <= diagnostic_tolerance),
         complementarity_residual=float(residual))
 
 
-def compress_mixture(weights, max_active=None):
-    """Deterministically retain the largest weights and renormalize exactly.
-
-    Support selection uses training output only.  Every cutoff is recomputed
-    later on independent data, so the compressed distribution is simply a new
-    valid null mixture rather than an approximation used inside certification.
-    """
-    weights = np.asarray(weights, dtype=float).ravel()
-    if (weights.size == 0 or not np.all(np.isfinite(weights))
-            or np.any(weights < 0.0) or weights.sum() <= 0.0):
-        raise ValueError("mixture weights must be finite and nonnegative")
-    weights = weights / weights.sum()
-    if max_active is None:
-        keep_count = weights.size
-    else:
-        keep_count = min(_validated_integer("max_active", max_active), weights.size)
-        if keep_count < 1:
-            raise ValueError("max_active must be positive")
-    order = np.argsort(-weights, kind="mergesort")
-    active = np.sort(order[:keep_count])
-    dropped = float(1.0 - weights[active].sum())
-    retained = weights[active]
-    retained = retained / retained.sum()
-    return active, retained, max(0.0, dropped)
 
 
 def _pooled_experiment_settings(grid, k_eff, M_start, M_step, M_max,
                                 mhg_tol, metadata=None):
-    """Canonical density-experiment identity shared by train/audit banks."""
+    """Canonical identity of the reusable direct-GKM null experiment."""
     settings = dict(
         schema_version=2, method=POOLED_IS_METHOD,
         grid=np.asarray(grid, dtype=float).tolist(), k_eff=int(k_eff),
@@ -1657,7 +1278,7 @@ def _pooled_experiment_settings(grid, k_eff, M_start, M_step, M_max,
 
 
 def _canonical_pooled_mhg_diagnostics(diagnostics, expected_pairs):
-    """Validate and canonicalize the numerical audit attached to a bank."""
+    """Validate and canonicalize the numerical diagnostics attached to a bank."""
     if not isinstance(diagnostics, dict):
         raise ValueError("pooled bank MHG diagnostics must be a dictionary")
     required = {
@@ -1675,7 +1296,12 @@ def _canonical_pooled_mhg_diagnostics(diagnostics, expected_pairs):
                   for key, value in diagnostics["order_counts"].items()}
     except (TypeError, ValueError, AttributeError) as exc:
         raise ValueError("pooled bank MHG diagnostics are malformed") from exc
-    if (pairs != int(expected_pairs) or raw < pairs or max_order < 0
+    # A pair with an exactly zero hypergeometric argument is evaluated by the
+    # analytic 0F1=1 shortcut and is recorded at order zero without entering
+    # the C routine.  Every other pair must contribute at least one raw C
+    # evaluation; adaptive retries may make ``raw`` larger.
+    minimum_raw = pairs - counts.get(0, 0)
+    if (pairs != int(expected_pairs) or raw < minimum_raw or max_order < 0
             or not np.isfinite(max_remainder) or max_remainder < 0.0
             or any(key < 0 or value < 0 for key, value in counts.items())
             or sum(counts.values()) != pairs
@@ -1717,15 +1343,15 @@ def _pooled_bank_settings(grid, role, k_eff, n_per_stratum, seed,
 def build_or_load_pooled_is_bank(grid, k_eff, n_per_stratum, seed,
                                  M_start=20, M_step=MHG_DEFAULT_STEP,
                                  M_max=MHG_DEFAULT_MAX, mhg_tol=MHG_CONV_TOL,
-                                 n_workers=1, role="training",
+                                 n_workers=1, role="gkm",
                                  cache_dir=None, cache_metadata=None):
     """Build/cache one beta-invariant GKM stratified null bank."""
     grid = _validated_null_grid(grid, 3, "common pooled null grid")
     n_per_stratum = _validated_integer(
         "n_per_stratum", n_per_stratum, minimum=2)
     k_eff = _validated_integer("k_eff", k_eff)
-    if role not in ("training", "audit"):
-        raise ValueError("pooled bank role must be 'training' or 'audit'")
+    if role != "gkm":
+        raise ValueError("direct calculation requires pooled bank role 'gkm'")
     settings = _pooled_bank_settings(
         grid, role, k_eff, n_per_stratum, seed, M_start, M_step, M_max,
         mhg_tol, cache_metadata)
@@ -1911,22 +1537,29 @@ def _authenticated_pooled_bank_settings(bank):
 # ALFD with eigenvalue density
 # ============================================================
 
-def _sample_mixture_eigenvalues(M_nulls, weights, n_sim, rng):
-    labels = rng.choice(len(M_nulls), size=int(n_sim), p=weights)
-    p = M_nulls[0].shape[1]
-    eigs = np.empty((int(n_sim), p))
-    for j, M_null in enumerate(M_nulls):
-        locations = np.flatnonzero(labels == j)
-        if locations.size:
-            Xi = simulate_Xi(M_null, locations.size, rng)
-            eigs[locations] = eigenvalues_descending(Xi)
-    return eigs, labels
 
 
-def _score_from_log_densities(log_densities, weights):
-    G = len(weights)
+def _score_from_log_densities(log_densities, weights=None, *,
+                              log_weights=None):
+    """Log likelihood-ratio score for a normalized finite null mixture.
+
+    Direct GKM calculations pass ``log_weights`` so subnormal mixture masses
+    remain represented.  ``weights`` is retained for small public/test uses.
+    """
+    if (weights is None) == (log_weights is None):
+        raise ValueError("provide exactly one of weights or log_weights")
+    if log_weights is None:
+        normalized_logs = _log_probability_weights(weights)
+    else:
+        normalized_logs = np.asarray(log_weights, dtype=float)
+        if (normalized_logs.ndim != 1
+                or not np.all(np.isfinite(normalized_logs))
+                or not np.isclose(logsumexp(normalized_logs), 0.0,
+                                  rtol=0.0, atol=2e-12)):
+            raise ValueError("log_weights must be finite and normalized")
+    G = len(normalized_logs)
     log_mix = logsumexp(
-        _log_probability_weights(weights)[:, None] + log_densities[:G], axis=0)
+        normalized_logs[:, None] + log_densities[:G], axis=0)
     return log_densities[G] - log_mix
 
 
@@ -1948,36 +1581,23 @@ def _combine_phase_mhg_diagnostics(phases):
     return combined
 
 
-def _exact_null_result(alpha, G, null_grid=None):
+
+
+def _exact_gkm_result(alpha, G):
     rule = TailRule(0.0, float(alpha), float(alpha),
                     "exact_null_randomization")
-    exact_weights = np.full(G, 1.0 / G)
-    active_grid = (None if null_grid is None
-                   else np.asarray(null_grid, dtype=float).copy())
-    return ALFDBoundResult(
-        upper_point=float(alpha), upper_point_se=0.0,
-        upper_confidence=float(alpha), lower_grid_point=float(alpha),
-        lower_grid_confidence=float(alpha), epsilon_grid_point=0.0,
-        epsilon_grid_confidence=0.0, confidence_level=1.0,
-        weights=exact_weights,
+    return GKMDirectResult(
+        bound=float(alpha), bound_se=0.0,
+        mixture_power=float(alpha), mixture_power_se=0.0,
+        epsilon_grid=0.0, weights=np.full(G, 1.0 / G),
+        log_weights=np.full(G, -math.log(G)),
         fit_rejection_probabilities=np.full(G, alpha),
-        fit_complementarity_residual=0.0, fit_converged=True,
-        fit_iterations=0,
-        point_rule=rule, upper_confidence_rule=rule,
-        lower_grid_rule=rule, lower_grid_confidence_rule=rule,
-        calibration_component_counts=np.zeros(G, dtype=int),
-        validation_rejection_probabilities=np.full(G, alpha),
-        invariant_benchmark_power=float(alpha), invariant_benchmark_se=0.0,
-        invariant_benchmark_lower_confidence=float(alpha),
-        mhg_diagnostics=dict(pairs=0, raw_evaluations=0, max_order=0,
-                             max_remainder_ratio=0.0,
-                             order_counts={}, phases={}),
-        full_weights=exact_weights.copy(), active_indices=np.arange(G),
-        active_null_grid=active_grid, discarded_weight_mass=0.0,
-        gkm_point_upper=float(alpha), gkm_grid_lower=float(alpha),
-        gkm_epsilon=0.0,
+        grid_rejection_probabilities=np.full(G, alpha),
+        fit_iterations=0, mixture_rule=rule, grid_rule=rule,
         importance_diagnostics=dict(exact_null=True),
-        grid_bracket_confidence_level=1.0)
+        mhg_diagnostics=dict(
+            pairs=0, raw_evaluations=0, max_order=0,
+            max_remainder_ratio=0.0, order_counts={}, phases={}))
 
 
 def _validated_null_grid(rows, dimension, name):
@@ -1998,614 +1618,169 @@ def _validated_null_grid(rows, dimension, name):
     return result
 
 
-def _union_null_grids(first, second):
-    """Stable exact-value union used to retain every fitted support point."""
-    seen = set()
-    result = []
-    for row in list(first) + list(second):
-        key = tuple(row)
-        if key not in seen:
-            seen.add(key)
-            result.append(key)
-    return result
 
 
-def alfd_eigval_bound(kappas_alt, grid_kappas_null, k_eff,
-                     alpha=0.05, n_sim=1000, n_sim_power=50000,
-                     n_iter=600, M_trunc=20, seed=42, verbose=True,
-                     n_workers=1, n_sim_calibration=20000,
-                     n_sim_validation=2000,
-                     validation_grid_kappas_null=None,
-                     confidence_delta=0.01,
-                     M_step=MHG_DEFAULT_STEP, M_max=MHG_DEFAULT_MAX,
-                     mhg_tol=MHG_CONV_TOL, return_result=False,
-                     alternative_is_exact_null=False):
-    """Compute an EMW upper bound and a GKM finite-grid epsilon bracket.
 
-    The critical distinction from the previous implementation is that the EMW
-    weights are normalized and then calibrated on a fresh iid sample from the
-    fitted null mixture.  ``upper_point`` is the paper-style Monte Carlo point
-    estimate.  ``upper_confidence`` additionally uses a liberal order-statistic
-    cutoff and a one-sided binomial power limit, making it a confidence-valid
-    upper bound conditional on the density accuracy.
 
-    ``lower_grid_*`` and ``epsilon_grid_*`` implement GKM's tightened critical
-    value on an independent finite null grid.  They are not advertised as
-    global certificates for the unbounded three-dimensional null cone.
+def gkm_eigval_bound_from_pooled_bank(
+        kappas_alt, bank, k_eff, alpha=0.05, n_sim_power=100000,
+        n_iter=600, seed=42, verbose=True, n_workers=1,
+        M_trunc=20, M_step=MHG_DEFAULT_STEP,
+        M_max=MHG_DEFAULT_MAX, mhg_tol=MHG_CONV_TOL):
+    """Direct m_W=3 implementation of GKM Supplement D.3.2 Steps 3--9.
 
-    The default scalar return is ``upper_confidence`` so callers cannot mistake
-    the paper-style finite-Monte-Carlo point estimate for a guaranteed endpoint.
-    Set ``return_result=True`` to retain both endpoints and all diagnostics.
+    The supplied bank is GKM's single Step-1/2 pooled ``N0`` experiment and
+    is reused for fitting, Step-6 mixture calibration, and Step-8 grid
+    adjustment.  Step 7 and Step 9 are evaluated on the same fresh ``N1``
+    alternative draws.  No support compression, independent audit,
+    sample-split recalibration, or Monte Carlo confidence correction is used.
     """
-    kappas_alt = np.asarray(kappas_alt, dtype=float)
-    if kappas_alt.ndim != 1 or kappas_alt.size == 0:
-        raise ValueError("alternative NCP eigenvalues must be a nonempty vector")
-    p = kappas_alt.size
-    grid_kappas_null = _validated_null_grid(
-        grid_kappas_null, p - 1, "fit null grid")
-    G = len(grid_kappas_null)
     k_eff = _validated_integer("k_eff", k_eff)
-    if G == 0 or k_eff < p:
-        raise ValueError("need a nonempty null grid and k_eff >= p")
-    if (not np.all(np.isfinite(kappas_alt)) or np.any(kappas_alt < 0.0)
-            or np.any(np.diff(kappas_alt) > 1e-10)):
-        raise ValueError("alternative NCP eigenvalues must be finite, nonnegative and ordered")
-    if not (0.0 < alpha < 1.0) or not (0.0 < confidence_delta < 1.0):
-        raise ValueError("alpha and confidence_delta must lie in (0,1)")
-    if not isinstance(alternative_is_exact_null, (bool, np.bool_)):
-        raise ValueError("alternative_is_exact_null must be boolean")
-
-    # Rank deficiency must be known from the model, not inferred by thresholding
-    # a small positive eigenvalue.  Otherwise a genuine nearby alternative could
-    # be incorrectly replaced by alpha, which is not an upper bound there.
-    if alternative_is_exact_null:
-        numerical_zero_tol = (100.0 * np.finfo(float).eps
-                              * max(1.0, kappas_alt[0]))
-        if kappas_alt[-1] > numerical_zero_tol:
-            raise ValueError(
-                "alternative_is_exact_null=True but the smallest NCP is "
-                "materially positive")
-        result = _exact_null_result(alpha, G)
-        return result if return_result else result.upper_confidence
-
-    n_sim = _validated_integer("n_sim", n_sim, minimum=2)
-    n_sim_calibration = _validated_integer(
-        "n_sim_calibration", n_sim_calibration, minimum=2)
-    n_sim_validation = _validated_integer(
-        "n_sim_validation", n_sim_validation, minimum=2)
     n_sim_power = _validated_integer(
         "n_sim_power", n_sim_power, minimum=2)
     n_iter = _validated_integer("n_iter", n_iter)
-    n_workers = _validated_integer("n_workers", n_workers)
-
-    requested_validation_grid = (
-        grid_kappas_null if validation_grid_kappas_null is None
-        else _validated_null_grid(
-            validation_grid_kappas_null, p - 1, "validation null grid"))
-    # A finite-grid GKM bracket must constrain every support point used by the
-    # fitted mixture.  Custom validation grids are therefore augmented rather
-    # than trusted to contain the fit support themselves.
-    validation_grid = _union_null_grids(
-        grid_kappas_null, requested_validation_grid)
-    V = len(validation_grid)
-
-    seed_sequences = np.random.SeedSequence(seed).spawn(4)
-    rng_fit, rng_cal, rng_validation, rng_power = [
-        np.random.default_rng(child) for child in seed_sequences]
-    c_0F1 = k_eff / 2.0
-    M_alt = build_M(kappas_alt, k_eff)
-    M_nulls = [build_M(list(row) + [0.0], k_eff)
-               for row in grid_kappas_null]
-    Omega_alt = kappas_alt
-    Omegas_null = np.array([list(row) + [0.0]
-                            for row in grid_kappas_null], dtype=float)
-    Omegas_all = np.vstack([Omegas_null, Omega_alt[None]])
-    phase_diagnostics = {}
-
-    if verbose:
-        print(f"    G_fit={G}, G_validate={V}, n_fit/null={n_sim}, "
-              f"n_cal_mix={n_sim_calibration}, n_validate/null={n_sim_validation}, "
-              f"n_power={n_sim_power}")
-        print(f"    adaptive 0F1: start={M_trunc}, step={M_step}, "
-              f"max={M_max}, tol={mhg_tol:.1e}", flush=True)
-
-    # 1. Independent direct null samples for the EMW weight iteration.
-    eigs_train = np.empty((G, int(n_sim), p))
-    for j, M_null in enumerate(M_nulls):
-        eigs_train[j] = eigenvalues_descending(
-            simulate_Xi(M_null, int(n_sim), rng_fit))
-    log_dens, phase_diagnostics["fit"] = log_eigval_density_partial(
-        eigs_train.reshape(G * int(n_sim), p), Omegas_all, c_0F1,
-        M_trunc=M_trunc, chunk_size=100, progress_label="fit",
-        n_workers=n_workers, M_step=M_step, M_max=M_max,
-        mhg_tol=mhg_tol, return_diagnostics=True)
-    log_f = log_dens[:G].reshape(G, G, int(n_sim))
-    log_g = log_dens[G].reshape(G, int(n_sim))
-    fit = fit_emw_weights(log_f, log_g, alpha=alpha, n_iter=n_iter)
-    del log_dens, log_f, log_g, eigs_train
-    gc.collect()
-    if verbose:
-        print(f"    EMW weights: {np.round(fit.weights, 6).tolist()}")
-        print(f"    calibrated training RP: "
-              f"{np.round(fit.rejection_probabilities, 5).tolist()}  "
-              f"complementarity residual={fit.complementarity_residual:.5f}  "
-              f"converged={fit.converged}", flush=True)
-
-    # 2. EMW/GKM Step 5/6: freeze lambda and independently solve the scalar
-    # mixture critical value.  Sampling component labels produces iid draws
-    # from f_lambda without needing N observations under every support point.
-    eigs_cal, cal_labels = _sample_mixture_eigenvalues(
-        M_nulls, fit.weights, int(n_sim_calibration), rng_cal)
-    log_cal, phase_diagnostics["mixture_calibration"] = log_eigval_density_partial(
-        eigs_cal, Omegas_all, c_0F1, M_trunc=M_trunc, chunk_size=100,
-        progress_label="mixture-cal", n_workers=n_workers, M_step=M_step,
-        M_max=M_max, mhg_tol=mhg_tol, return_diagnostics=True)
-    scores_cal = _score_from_log_densities(log_cal, fit.weights)
-    point_rule = calibrate_empirical_tail(
-        scores_cal, alpha, method="independent_mixture_quantile")
-
-    # The primary upper is a two-event confidence family: liberal mixture
-    # calibration plus the alternative-power CP limit.  The optional finite-
-    # grid lower is a separate two-event family.  This avoids making the upper
-    # unnecessarily loose merely because the diagnostic lower is requested.
-    upper_delta_each = confidence_delta / 2.0
-    grid_delta_each = confidence_delta / 2.0
-    upper_conf_rule = confidence_liberal_tail_rule(
-        scores_cal, alpha, upper_delta_each)
-    component_counts = np.bincount(cal_labels, minlength=G)
-    del log_cal, eigs_cal, scores_cal
-    gc.collect()
-
-    # 3. GKM Step 8: independent null-grid validation and critical-value
-    # tightening.  The LR still uses the fitted support mixture in its denominator.
-    M_validation = [build_M(list(row) + [0.0], k_eff)
-                    for row in validation_grid]
-    eigs_validation = np.empty((V, int(n_sim_validation), p))
-    for j, M_null in enumerate(M_validation):
-        eigs_validation[j] = eigenvalues_descending(
-            simulate_Xi(M_null, int(n_sim_validation), rng_validation))
-    log_validation, phase_diagnostics["null_validation"] = \
-        log_eigval_density_partial(
-            eigs_validation.reshape(V * int(n_sim_validation), p),
-            Omegas_all, c_0F1, M_trunc=M_trunc, chunk_size=100,
-            progress_label="null-validation", n_workers=n_workers,
-            M_step=M_step, M_max=M_max, mhg_tol=mhg_tol,
-            return_diagnostics=True)
-    scores_validation = _score_from_log_densities(
-        log_validation, fit.weights).reshape(V, int(n_sim_validation))
-    validation_rp = np.mean(
-        tail_rejection_probabilities(scores_validation, point_rule), axis=1)
-    lower_grid_rule = common_grid_tail_rule(
-        scores_validation, alpha, minimum_rule=point_rule)
-
-    per_null_delta = grid_delta_each / V
-    conservative_rules = [confidence_conservative_tail_rule(
-        row, alpha, per_null_delta) for row in scores_validation]
-    conservative_threshold = max(
-        [upper_conf_rule.threshold]
-        + [rule.threshold for rule in conservative_rules])
-    lower_grid_conf_rule = TailRule(
-        float(conservative_threshold), 0.0,
-        float(np.max(np.mean(scores_validation > conservative_threshold,
-                             axis=1))),
-        "simultaneous_grid_order_statistic_size_at_most_alpha")
-    del log_validation, eigs_validation
-    gc.collect()
-
-    # 4. Fresh alternative sample for all reported power endpoints.
-    eigs_power = eigenvalues_descending(
-        simulate_Xi(M_alt, int(n_sim_power), rng_power))
-    log_power, phase_diagnostics["alternative_power"] = log_eigval_density_partial(
-        eigs_power, Omegas_all, c_0F1, M_trunc=M_trunc, chunk_size=100,
-        progress_label="power", n_workers=n_workers, M_step=M_step,
-        M_max=M_max, mhg_tol=mhg_tol, return_diagnostics=True)
-    scores_power = _score_from_log_densities(log_power, fit.weights)
-
-    benchmark_rejection = (eigs_power[:, -1]
-                           > chi2.ppf(1.0 - alpha, df=k_eff - p + 1))
-    benchmark_count = int(np.count_nonzero(benchmark_rejection))
-    benchmark_power = float(benchmark_count / int(n_sim_power))
-    benchmark_se = float(np.sqrt(
-        benchmark_power * (1.0 - benchmark_power) / int(n_sim_power)))
-    benchmark_lower_confidence = clopper_pearson(
-        benchmark_count, int(n_sim_power), upper_delta_each, "lower")
-
-    point_rejection = tail_rejection_probabilities(scores_power, point_rule)
-    upper_point = float(np.mean(point_rejection))
-    upper_point_se = float(np.std(point_rejection, ddof=1)
-                           / np.sqrt(int(n_sim_power)))
-    upper_conf_count = int(np.count_nonzero(
-        scores_power > upper_conf_rule.threshold))
-    upper_confidence = clopper_pearson(
-        upper_conf_count, int(n_sim_power), upper_delta_each, "upper")
-
-    lower_point = float(np.mean(
-        tail_rejection_probabilities(scores_power, lower_grid_rule)))
-    lower_conf_count = int(np.count_nonzero(
-        scores_power > lower_grid_conf_rule.threshold))
-    lower_confidence = clopper_pearson(
-        lower_conf_count, int(n_sim_power), grid_delta_each, "lower")
-
-    # The rules are nested by construction; these inequalities catch any future
-    # regression in calibration/tie handling rather than clipping bad output.
-    if lower_point > upper_point + 1e-12:
-        raise AssertionError("GKM tightened rule has power above the EMW upper rule")
-    if lower_confidence > upper_confidence + 1e-12:
-        raise AssertionError("confidence bracket endpoints are reversed")
-    if not np.isclose(point_rule.empirical_size, alpha, atol=5e-13):
-        raise AssertionError("mixture point calibration did not attain alpha")
-    if not np.isclose(fit.weights.sum(), 1.0, atol=1e-12) \
-            or np.any(fit.weights < 0.0):
-        raise AssertionError("invalid normalized EMW weights")
-    if upper_confidence + 1e-12 < alpha:
-        raise AssertionError("confidence upper bound fell below alpha")
-    if upper_confidence + 1e-12 < benchmark_lower_confidence:
-        raise AssertionError(
-            "EMW confidence upper bound is below the same-experiment "
-            "smallest-eigenvalue benchmark's one-sided confidence lower "
-            "limit; increase simulation sizes")
-
-    result = ALFDBoundResult(
-        upper_point=upper_point, upper_point_se=upper_point_se,
-        upper_confidence=upper_confidence,
-        lower_grid_point=lower_point,
-        lower_grid_confidence=lower_confidence,
-        epsilon_grid_point=upper_point - lower_point,
-        epsilon_grid_confidence=upper_confidence - lower_confidence,
-        confidence_level=1.0 - confidence_delta,
-        weights=fit.weights,
-        fit_rejection_probabilities=fit.rejection_probabilities,
-        fit_complementarity_residual=fit.complementarity_residual,
-        fit_converged=fit.converged, fit_iterations=fit.iterations,
-        point_rule=point_rule, upper_confidence_rule=upper_conf_rule,
-        lower_grid_rule=lower_grid_rule,
-        lower_grid_confidence_rule=lower_grid_conf_rule,
-        calibration_component_counts=component_counts,
-        validation_rejection_probabilities=validation_rp,
-        invariant_benchmark_power=benchmark_power,
-        invariant_benchmark_se=benchmark_se,
-        invariant_benchmark_lower_confidence=benchmark_lower_confidence,
-        mhg_diagnostics=_combine_phase_mhg_diagnostics(phase_diagnostics),
-        grid_bracket_confidence_level=max(
-            0.0, 1.0 - 2.0 * confidence_delta))
-    if verbose:
-        print(f"    EMW point upper={upper_point:.5f} (SE {upper_point_se:.5f}); "
-              f"confidence upper={upper_confidence:.5f}")
-        print(f"    grid lower={lower_point:.5f}; "
-              f"grid epsilon={upper_point-lower_point:.5f}; "
-              f"max validation RP before tightening={validation_rp.max():.5f}")
-        print(f"    same-experiment chi-square benchmark={benchmark_power:.5f} "
-              f"(SE {benchmark_se:.5f}, one-sided lower "
-              f"{benchmark_lower_confidence:.5f})")
-        print(f"    adaptive 0F1 selected orders: "
-              f"{result.mhg_diagnostics['order_counts']}", flush=True)
-
-    return result if return_result else result.upper_confidence
-
-
-def alfd_eigval_bound_from_pooled_banks(
-        kappas_alt, training_bank, audit_bank, k_eff, alpha=0.05,
-        n_sim_calibration=20000, n_sim_power=50000, n_iter=600,
-        max_active_support=8, seed=42, verbose=True, n_workers=1,
-        confidence_delta=0.01, M_trunc=20, M_step=MHG_DEFAULT_STEP,
-        M_max=MHG_DEFAULT_MAX, mhg_tol=MHG_CONV_TOL):
-    """Hybrid GKM/EMW bound using shared IS discovery and iid certification.
-
-    The pooled banks may be reused across alternatives.  Only the training bank
-    selects weights/support.  The audit bank is independent, while mixture
-    calibration and alternative power use fresh iid streams.  Consequently the
-    saved confidence upper retains the same conditional finite-MC guarantee as
-    :func:`alfd_eigval_bound`.
-    """
-    k_eff = _validated_integer("k_eff", k_eff)
+    seed = _validated_integer("seed", seed, minimum=0)
     M_trunc = _validated_integer("M_trunc", M_trunc)
     M_step = _validated_integer("M_step", M_step)
     M_max = _validated_integer("M_max", M_max)
-    seed = _validated_integer("seed", seed, minimum=0)
     if (M_trunc > M_max or not np.isfinite(mhg_tol)
             or not (1e-13 <= mhg_tol < 1.0)):
         raise ValueError("invalid adaptive-M settings")
-    H, N_train = _validate_pooled_is_bank(training_bank)
-    H_audit, N_audit = _validate_pooled_is_bank(audit_bank)
-    if (training_bank.role != "training" or audit_bank.role != "audit"
-            or training_bank.bank_id == audit_bank.bank_id):
-        raise ValueError("training and audit banks must be distinct and correctly typed")
-    if H != H_audit or not np.array_equal(training_bank.grid, audit_bank.grid):
-        raise ValueError("training and audit banks must use the same ordered grid")
-    if (training_bank.sampling_seed is None
-            or audit_bank.sampling_seed is None
-            or int(training_bank.sampling_seed) == int(audit_bank.sampling_seed)):
+
+    H, _ = _validate_pooled_is_bank(bank)
+    if bank.role != "gkm":
+        raise ValueError("direct GKM calculation requires a role='gkm' bank")
+    settings = _authenticated_pooled_bank_settings(bank)
+    if bank.k_eff is None or int(bank.k_eff) != k_eff:
+        raise ValueError("pooled bank was built for a different k_eff")
+    if seed == int(bank.sampling_seed):
+        raise ValueError("alternative-power seed must differ from the bank seed")
+    if (int(settings["M_start"]) != M_trunc
+            or int(settings["M_step"]) != M_step
+            or int(settings["M_max"]) != M_max
+            or float(settings["mhg_tol"]) != float(mhg_tol)):
         raise ValueError(
-            "training and audit banks must record distinct sampling seeds")
-    if seed in (int(training_bank.sampling_seed),
-                int(audit_bank.sampling_seed)):
-        raise ValueError(
-            "iid calibration/power seed must differ from pooled-bank seeds")
-    training_settings = _authenticated_pooled_bank_settings(training_bank)
-    audit_settings = _authenticated_pooled_bank_settings(audit_bank)
-    if (training_bank.experiment_signature is None
-            or training_bank.experiment_signature
-            != audit_bank.experiment_signature):
-        raise ValueError(
-            "training and audit banks must share one authenticated density "
-            "experiment")
-    if training_bank.content_signature == audit_bank.content_signature:
-        raise ValueError(
-            "training and audit banks have identical numeric content and "
-            "cannot support an independence claim")
-    if (training_bank.eigs.shape == audit_bank.eigs.shape
-            and np.array_equal(training_bank.eigs, audit_bank.eigs)):
-        raise ValueError(
-            "training and audit banks contain identical sampled eigenvalues "
-            "and cannot support an independence claim")
-    if (training_bank.k_eff is None or audit_bank.k_eff is None
-            or int(training_bank.k_eff) != int(k_eff)
-            or int(audit_bank.k_eff) != int(k_eff)):
-        raise ValueError("pooled banks were built for a different k_eff")
-    for settings in (training_settings, audit_settings):
-        if (int(settings["M_start"]) != M_trunc
-                or int(settings["M_step"]) != M_step
-                or int(settings["M_max"]) != M_max
-                or float(settings["mhg_tol"]) != float(mhg_tol)):
-            raise ValueError(
-                "call-time adaptive-M settings differ from pooled-bank "
-                "density settings")
-    if (training_bank.mhg_diagnostics is None
-            or audit_bank.mhg_diagnostics is None):
-        raise ValueError("certification banks must retain MHG diagnostics")
+            "call-time adaptive-M settings differ from pooled-bank settings")
 
     kappas_alt = np.asarray(kappas_alt, dtype=float)
     p = kappas_alt.size
     if (p != 4 or not np.all(np.isfinite(kappas_alt))
             or np.any(kappas_alt < 0.0)
             or np.any(np.diff(kappas_alt) > 1e-10)):
-        raise ValueError("pooled p=4 alternative eigenvalues are invalid")
-    if not (0.0 < alpha < 1.0) or not (0.0 < confidence_delta < 1.0):
-        raise ValueError("alpha and confidence_delta must lie in (0,1)")
-    n_sim_calibration = _validated_integer(
-        "n_sim_calibration", n_sim_calibration, minimum=2)
-    n_sim_power = _validated_integer("n_sim_power", n_sim_power, minimum=2)
-    if k_eff < p:
-        raise ValueError("k_eff must be at least p")
+        raise ValueError("direct GKM p=4 alternative eigenvalues are invalid")
+    if k_eff < p or not (0.0 < alpha < 1.0):
+        raise ValueError("require k_eff >= 4 and 0 < alpha < 1")
 
     omega_alt = kappas_alt[None, :]
     phase_diagnostics = {}
     log_g_train_matrix, phase_diagnostics["training_alternative"] = \
         log_eigval_density_partial(
-            training_bank.eigs, omega_alt, k_eff / 2.0,
+            bank.eigs, omega_alt, k_eff / 2.0,
             M_trunc=M_trunc, chunk_size=100,
-            progress_label="shared-train-g", n_workers=n_workers,
+            progress_label="gkm-train-g", n_workers=n_workers,
             M_step=M_step, M_max=M_max, mhg_tol=mhg_tol,
             return_diagnostics=True)
     log_g_train = log_g_train_matrix[0]
-    fit_full = fit_emw_weights_is(
-        training_bank, log_g_train, alpha=alpha, n_iter=n_iter)
-    active_indices, active_weights, dropped_mass = compress_mixture(
-        fit_full.weights, max_active=max_active_support)
-    active_grid = np.asarray(training_bank.grid)[active_indices]
-    active_log_f_train = training_bank.log_f[active_indices]
+    fit = fit_gkm_weights_is(
+        bank, log_g_train, alpha=alpha, n_iter=n_iter, step_size=2.0)
 
-    # GKM-comparable point calibration/tightening on the reusable discovery
-    # bank.  These are diagnostics, not the confidence-certified endpoint.
     log_mix_train = logsumexp(
-        _log_probability_weights(active_weights)[:, None]
-        + active_log_f_train, axis=0)
+        fit.log_weights[:, None] + bank.log_f, axis=0)
     scores_train = log_g_train - log_mix_train
-    mix_contributions = (training_bank.base_weights
-                         * np.exp(log_mix_train - training_bank.log_q))
-    gkm_point_rule = calibrate_raw_weighted_tail(
-        scores_train, mix_contributions, alpha,
-        method="gkm_reused_bank_mixture_ordinary_is")
-    target_contributions = (_pooled_is_ratios(training_bank)
-                            * training_bank.base_weights[None, :])
-    gkm_grid_rule = common_grid_raw_is_tail_rule(
+    target_contributions = (
+        _pooled_is_ratios(bank) * bank.base_weights[None, :])
+    grid_rule = common_grid_raw_is_tail_rule(
         scores_train, target_contributions, alpha,
-        minimum_rule=gkm_point_rule)
-    compressed_train_rp = gkm_importance_rejection_probabilities(
-        training_bank,
-        tail_rejection_probabilities(scores_train, gkm_point_rule))
-    active_mask = np.zeros(H, dtype=bool)
-    active_mask[active_indices] = True
-    active_residual = (float(np.max(np.abs(
-        compressed_train_rp[active_mask] - alpha)))
-        if np.any(active_mask) else 0.0)
-    slack_residual = (float(np.max(np.maximum(
-        compressed_train_rp[~active_mask] - alpha, 0.0)))
-        if np.any(~active_mask) else 0.0)
-    compressed_residual = max(active_residual, slack_residual)
-    max_contribution = float(np.max(
-        _pooled_is_ratios(training_bank)
-        * training_bank.base_weights[None, :]))
-    compressed_tolerance = max(2.0 * max_contribution, 5e-4)
-    compressed_converged = bool(compressed_residual <= compressed_tolerance)
-    is_diagnostics = pooled_is_diagnostics(
-        training_bank,
-        tail_rejection_probabilities(scores_train, gkm_point_rule))
-    is_diagnostics.update(
-        full_fit_converged=bool(fit_full.converged),
-        full_fit_complementarity_residual=float(
-            fit_full.complementarity_residual),
-        compressed_fit_converged=compressed_converged,
-        compressed_fit_complementarity_residual=float(compressed_residual),
-        compressed_fit_tolerance=float(compressed_tolerance))
+        minimum_rule=fit.training_rule)
+    mixture_rejection_train = tail_rejection_probabilities(
+        scores_train, fit.training_rule)
+    grid_rejection_train = tail_rejection_probabilities(
+        scores_train, grid_rule)
+    grid_rejection_probabilities = (
+        target_contributions @ grid_rejection_train)
+    if np.max(grid_rejection_probabilities) > alpha + 2e-12:
+        raise AssertionError("GKM Step-8 rule exceeds alpha on the null grid")
+    importance_diagnostics = pooled_is_diagnostics(
+        bank, mixture_rejection_train)
+    importance_diagnostics.update(
+        final_complementarity_residual=float(
+            fit.complementarity_residual),
+        final_complementarity_diagnostic_passed=bool(fit.converged))
 
     if verbose:
-        print(f"    common GKM grid H={H}; pooled observations={N_train:,}; "
-              f"active support={len(active_indices)}; discarded weight="
-              f"{dropped_mass:.3e}")
-        print(f"    active grid indices={active_indices.tolist()}; weights="
-              f"{np.round(active_weights, 6).tolist()}")
+        print(f"    direct GKM common grid H={H}; pooled N0 observations="
+              f"{bank.eigs.shape[0]:,}; full mixture support={H}")
+        print(f"    Step 5 fixed update: mu0=-2, omega=2, O={n_iter}; "
+              f"final residual={fit.complementarity_residual:.3e}")
         print(f"    ordinary-IS mass range="
-              f"[{np.min(is_diagnostics['raw_mass']):.4f}, "
-              f"{np.max(is_diagnostics['raw_mass']):.4f}]; min ESS fraction="
-              f"{np.min(is_diagnostics['kish_ess_fraction']):.3f}", flush=True)
+              f"[{np.min(importance_diagnostics['raw_mass']):.4f}, "
+              f"{np.max(importance_diagnostics['raw_mass']):.4f}]; "
+              f"min ESS fraction="
+              f"{np.min(importance_diagnostics['kish_ess_fraction']):.3f}",
+              flush=True)
 
-    M_active = [build_M(list(row) + [0.0], k_eff) for row in active_grid]
-    omegas_active = np.asarray(
-        [list(row) + [0.0] for row in active_grid], dtype=float)
-    omegas_score = np.vstack([omegas_active, omega_alt])
-    rng_cal, rng_power = [np.random.default_rng(child) for child in
-                          np.random.SeedSequence(seed).spawn(2)]
-
-    # Fresh iid mixture calibration: this is deliberately not importance
-    # sampled, since the order-statistic confidence argument requires iid
-    # scores from the frozen mixture.
-    eigs_cal, cal_labels = _sample_mixture_eigenvalues(
-        M_active, active_weights, n_sim_calibration, rng_cal)
-    log_cal, phase_diagnostics["mixture_calibration"] = \
-        log_eigval_density_partial(
-            eigs_cal, omegas_score, k_eff / 2.0, M_trunc=M_trunc,
-            chunk_size=100, progress_label="iid-mixture-cal",
-            n_workers=n_workers, M_step=M_step, M_max=M_max,
-            mhg_tol=mhg_tol, return_diagnostics=True)
-    scores_cal = _score_from_log_densities(log_cal, active_weights)
-    point_rule = calibrate_empirical_tail(
-        scores_cal, alpha, method="independent_mixture_quantile")
-    upper_delta_each = confidence_delta / 2.0
-    grid_delta_each = confidence_delta / 2.0
-    upper_conf_rule = confidence_liberal_tail_rule(
-        scores_cal, alpha, upper_delta_each)
-    component_counts = np.bincount(
-        cal_labels, minlength=len(active_weights))
-    del eigs_cal, log_cal, scores_cal
-    gc.collect()
-
-    # Independent common-grid audit.  Samples are direct iid draws within each
-    # stratum, so the existing binomial order-statistic rules remain valid.
-    log_g_audit_matrix, phase_diagnostics["audit_alternative"] = \
-        log_eigval_density_partial(
-            audit_bank.eigs, omega_alt, k_eff / 2.0,
-            M_trunc=M_trunc, chunk_size=100,
-            progress_label="shared-audit-g", n_workers=n_workers,
-            M_step=M_step, M_max=M_max, mhg_tol=mhg_tol,
-            return_diagnostics=True)
-    log_mix_audit = logsumexp(
-        _log_probability_weights(active_weights)[:, None]
-        + audit_bank.log_f[active_indices], axis=0)
-    scores_audit = (log_g_audit_matrix[0] - log_mix_audit).reshape(
-        H, audit_bank.n_per_stratum)
-    validation_rp = np.mean(
-        tail_rejection_probabilities(scores_audit, point_rule), axis=1)
-    lower_grid_rule = common_grid_tail_rule(
-        scores_audit, alpha, minimum_rule=point_rule)
-    per_null_delta = grid_delta_each / H
-    conservative_rules = [confidence_conservative_tail_rule(
-        row, alpha, per_null_delta) for row in scores_audit]
-    conservative_threshold = max(
-        [upper_conf_rule.threshold]
-        + [rule.threshold for rule in conservative_rules])
-    lower_grid_conf_rule = TailRule(
-        float(conservative_threshold), 0.0,
-        float(np.max(np.mean(scores_audit > conservative_threshold, axis=1))),
-        "simultaneous_grid_order_statistic_size_at_most_alpha")
-
-    # Fresh alternative sample shared by all point/confidence endpoints.
+    omegas_null = np.asarray(
+        [list(row) + [0.0] for row in bank.grid], dtype=float)
+    omegas_score = np.vstack([omegas_null, omega_alt])
+    rng_power = np.random.default_rng(seed)
     M_alt = build_M(kappas_alt, k_eff)
     eigs_power = eigenvalues_descending(
         simulate_Xi(M_alt, n_sim_power, rng_power))
     log_power, phase_diagnostics["alternative_power"] = \
         log_eigval_density_partial(
-            eigs_power, omegas_score, k_eff / 2.0, M_trunc=M_trunc,
-            chunk_size=100, progress_label="iid-power", n_workers=n_workers,
+            eigs_power, omegas_score, k_eff / 2.0,
+            M_trunc=M_trunc, chunk_size=100,
+            progress_label="gkm-power", n_workers=n_workers,
             M_step=M_step, M_max=M_max, mhg_tol=mhg_tol,
             return_diagnostics=True)
-    scores_power = _score_from_log_densities(log_power, active_weights)
+    scores_power = _score_from_log_densities(
+        log_power, log_weights=fit.log_weights)
 
-    benchmark_rejection = (
-        eigs_power[:, -1] > chi2.ppf(1.0 - alpha, df=k_eff - p + 1))
-    benchmark_count = int(np.count_nonzero(benchmark_rejection))
-    benchmark_power = float(benchmark_count / n_sim_power)
-    benchmark_se = float(np.sqrt(
-        benchmark_power * (1.0 - benchmark_power) / n_sim_power))
-    benchmark_lower_confidence = clopper_pearson(
-        benchmark_count, n_sim_power, upper_delta_each, "lower")
-
-    point_rejection = tail_rejection_probabilities(scores_power, point_rule)
-    upper_point = float(np.mean(point_rejection))
-    upper_point_se = float(np.std(point_rejection, ddof=1)
-                           / np.sqrt(n_sim_power))
-    upper_conf_count = int(np.count_nonzero(
-        scores_power > upper_conf_rule.threshold))
-    upper_confidence = clopper_pearson(
-        upper_conf_count, n_sim_power, upper_delta_each, "upper")
-    lower_point = float(np.mean(
-        tail_rejection_probabilities(scores_power, lower_grid_rule)))
-    lower_conf_count = int(np.count_nonzero(
-        scores_power > lower_grid_conf_rule.threshold))
-    lower_confidence = clopper_pearson(
-        lower_conf_count, n_sim_power, grid_delta_each, "lower")
-    gkm_point_upper = float(np.mean(
-        tail_rejection_probabilities(scores_power, gkm_point_rule)))
-    gkm_grid_lower = float(np.mean(
-        tail_rejection_probabilities(scores_power, gkm_grid_rule)))
-
-    if lower_point > upper_point + 1e-12:
-        raise AssertionError("independent grid-tightened power exceeds point upper")
-    if lower_confidence > upper_confidence + 1e-12:
-        raise AssertionError("confidence bracket endpoints are reversed")
-    if gkm_grid_lower > gkm_point_upper + 1e-12:
-        raise AssertionError("GKM grid-tightened power exceeds its point upper")
-    if not np.isclose(point_rule.empirical_size, alpha, atol=5e-13):
-        raise AssertionError("iid mixture calibration did not attain alpha")
-    if upper_confidence + 1e-12 < alpha:
-        raise AssertionError("confidence upper bound fell below alpha")
-    if upper_confidence + 1e-12 < benchmark_lower_confidence:
+    mixture_rejection = tail_rejection_probabilities(
+        scores_power, fit.training_rule)
+    grid_rejection = tail_rejection_probabilities(scores_power, grid_rule)
+    mixture_power = float(np.mean(mixture_rejection))
+    bound = float(np.mean(grid_rejection))
+    mixture_power_se = float(
+        np.std(mixture_rejection, ddof=1) / np.sqrt(n_sim_power))
+    bound_se = float(np.std(grid_rejection, ddof=1) / np.sqrt(n_sim_power))
+    epsilon = mixture_power - bound
+    if bound > mixture_power + 1e-12 or epsilon < -1e-12:
         raise AssertionError(
-            "EMW confidence upper is below the same-experiment benchmark lower")
+            "GKM Step-9 grid-adjusted power exceeds Step-7 mixture power")
+    if not np.isclose(
+            fit.training_rule.empirical_size, alpha, rtol=0.0, atol=5e-13):
+        raise AssertionError("GKM Step-6 mixture calibration missed alpha")
 
-    # Shared bank diagnostics are recorded once in the bank cache; include them
-    # here for max-order/provenance inspection but callers should not sum these
-    # repeated per-beta counts as runtime work.
+    # The shared bank's diagnostic is included for convenient max-order
+    # inspection.  Runtime accounting in main records its pairs only once.
     all_phases = dict(phase_diagnostics)
-    all_phases["shared_training_null_bank"] = training_bank.mhg_diagnostics
-    all_phases["shared_audit_null_bank"] = audit_bank.mhg_diagnostics
+    all_phases["shared_null_bank"] = bank.mhg_diagnostics
     mhg_diagnostics = _combine_phase_mhg_diagnostics(all_phases)
-    result = ALFDBoundResult(
-        upper_point=upper_point, upper_point_se=upper_point_se,
-        upper_confidence=upper_confidence,
-        lower_grid_point=lower_point,
-        lower_grid_confidence=lower_confidence,
-        epsilon_grid_point=upper_point - lower_point,
-        epsilon_grid_confidence=upper_confidence - lower_confidence,
-        confidence_level=1.0 - confidence_delta,
-        weights=active_weights,
-        fit_rejection_probabilities=compressed_train_rp,
-        fit_complementarity_residual=compressed_residual,
-        fit_converged=compressed_converged,
-        fit_iterations=fit_full.iterations,
-        point_rule=point_rule, upper_confidence_rule=upper_conf_rule,
-        lower_grid_rule=lower_grid_rule,
-        lower_grid_confidence_rule=lower_grid_conf_rule,
-        calibration_component_counts=component_counts,
-        validation_rejection_probabilities=validation_rp,
-        invariant_benchmark_power=benchmark_power,
-        invariant_benchmark_se=benchmark_se,
-        invariant_benchmark_lower_confidence=benchmark_lower_confidence,
-        mhg_diagnostics=mhg_diagnostics,
-        full_weights=fit_full.weights, active_indices=active_indices,
-        active_null_grid=active_grid,
-        discarded_weight_mass=dropped_mass,
-        gkm_point_upper=gkm_point_upper,
-        gkm_grid_lower=gkm_grid_lower,
-        gkm_epsilon=gkm_point_upper - gkm_grid_lower,
-        importance_diagnostics=is_diagnostics,
-        grid_bracket_confidence_level=max(
-            0.0, 1.0 - 2.0 * confidence_delta))
+    result = GKMDirectResult(
+        bound=bound, bound_se=bound_se,
+        mixture_power=mixture_power,
+        mixture_power_se=mixture_power_se,
+        epsilon_grid=epsilon,
+        weights=fit.weights,
+        log_weights=fit.log_weights,
+        fit_rejection_probabilities=fit.rejection_probabilities,
+        grid_rejection_probabilities=grid_rejection_probabilities,
+        fit_iterations=fit.iterations,
+        mixture_rule=fit.training_rule,
+        grid_rule=grid_rule,
+        importance_diagnostics=importance_diagnostics,
+        mhg_diagnostics=mhg_diagnostics)
     if verbose:
-        print(f"    independent point upper={upper_point:.5f} "
-              f"(SE {upper_point_se:.5f}); confidence upper="
-              f"{upper_confidence:.5f}")
-        print(f"    independent finite-grid lower={lower_point:.5f}; "
-              f"epsilon={upper_point-lower_point:.5f}; max validation RP="
-              f"{validation_rp.max():.5f}")
-        print(f"    GKM reused-bank point/grid power="
-              f"{gkm_point_upper:.5f}/{gkm_grid_lower:.5f}; "
-              f"epsilon={gkm_point_upper-gkm_grid_lower:.5f}", flush=True)
+        print(f"    GKM Step 7 bar(pi)={mixture_power:.5f} "
+              f"(MC SE {mixture_power_se:.5f}); Step 9 tilde(pi)="
+              f"{bound:.5f} (MC SE {bound_se:.5f}); "
+              f"epsilon={result.epsilon_grid:.5f}", flush=True)
     return result
 
 
 # ============================================================
-# Driver: common-grid production curve (11 beta points by default)
+# Driver: common-grid production curve (9 beta points by default)
 # ============================================================
 
 class _Tee:
@@ -2659,199 +1834,53 @@ def _format_duration(seconds):
     return f"{seconds / 86400.0:.1f} d"
 
 
-def _simulation_budget_diagnostics(alpha, curve_confidence, fit_grid_sizes,
-                                   validation_grid_sizes, budget,
-                                   events_per_family=4):
-    """Return confidence ranks, precision diagnostics, and exact pair counts.
-
-    ``fit_grid_sizes`` and ``validation_grid_sizes`` contain one entry for each
-    non-null beta.  This helper is deliberately pure: preflight and tests can
-    inspect exactly what a requested budget buys without evaluating a density.
-    """
-    if not (0.0 < alpha < 1.0) or not (0.0 < curve_confidence < 1.0):
-        raise ValueError("alpha and curve_confidence must lie in (0,1)")
-    fit_sizes = np.asarray(fit_grid_sizes, dtype=int)
-    validation_sizes = np.asarray(validation_grid_sizes, dtype=int)
-    if (fit_sizes.ndim != 1 or validation_sizes.shape != fit_sizes.shape
-            or fit_sizes.size == 0 or np.any(fit_sizes < 1)
-            or np.any(validation_sizes < fit_sizes)):
-        raise ValueError(
-            "need aligned positive fit/validation grid sizes for non-null betas")
-
-    n_fit = _validated_integer("n_fit", budget['n_fit'], minimum=2)
-    n_cal = _validated_integer(
-        "n_calibration", budget['n_calibration'], minimum=2)
-    n_validation = _validated_integer(
-        "n_validation", budget['n_validation'], minimum=2)
-    n_power = _validated_integer("n_power", budget['n_power'], minimum=2)
-    n_iter = _validated_integer("n_iter", budget['n_iter'])
-    _validated_integer("validation_grid_size", budget['validation_grid_size'])
-
-    n_nonnull = int(fit_sizes.size)
-    point_delta = (1.0 - float(curve_confidence)) / n_nonnull
-    events_per_family = _validated_integer(
-        "events_per_family", events_per_family, minimum=2)
-    if events_per_family not in (2, 4):
-        raise ValueError("events_per_family must be 2 or 4")
-    event_delta = point_delta / float(events_per_family)
-    calibration_count = _liberal_tail_rejection_count(
-        n_cal, alpha, event_delta)
-
-    validation_rows = []
-    for V in sorted(set(int(x) for x in validation_sizes)):
-        per_null_delta = event_delta / V
-        try:
-            rejection_count = _conservative_tail_rejection_count(
-                n_validation, alpha, per_null_delta)
-        except ValueError as exc:
-            raise ValueError(
-                f"n_validation={n_validation} cannot support the requested "
-                f"confidence after splitting over V={V} validation points") from exc
-        validation_rows.append(dict(
-            V=V, per_null_delta=float(per_null_delta),
-            rejection_count=int(rejection_count),
-            empirical_size=float(rejection_count / n_validation),
-            deflation=float(alpha - rejection_count / n_validation)))
-
-    cp_margins = {}
-    for probability in (alpha, 0.5):
-        count = int(round(probability * n_power))
-        observed = count / n_power
-        upper = clopper_pearson(count, n_power, event_delta, "upper")
-        cp_margins[probability] = float(upper - observed)
-
-    phase_pairs = dict(
-        fit=int(sum((G + 1) * G * n_fit for G in fit_sizes)),
-        calibration=int(sum((G + 1) * n_cal for G in fit_sizes)),
-        validation=int(sum((G + 1) * V * n_validation
-                           for G, V in zip(fit_sizes, validation_sizes))),
-        power=int(sum((G + 1) * n_power for G in fit_sizes)),
-    )
-    return dict(
-        n_nonnull=n_nonnull, point_delta=float(point_delta),
-        event_delta=float(event_delta),
-        events_per_family=int(events_per_family),
-        grid_bracket_curve_confidence=(
-            float(curve_confidence) if events_per_family == 4 else
-            max(0.0, 2.0 * float(curve_confidence) - 1.0)),
-        n_fit=n_fit, fit_grid_min=int(fit_sizes.min()),
-        fit_grid_max=int(fit_sizes.max()),
-        fit_tail_se=float(math.sqrt(alpha * (1.0 - alpha) / n_fit)),
-        n_iter=n_iter, n_calibration=n_cal,
-        calibration_rejection_count=int(calibration_count),
-        calibration_empirical_size=float(calibration_count / n_cal),
-        calibration_inflation=float(calibration_count / n_cal - alpha),
-        n_validation=n_validation, validation=validation_rows,
-        validation_grid_min=int(validation_sizes.min()),
-        validation_grid_max=int(validation_sizes.max()),
-        n_power=n_power, cp_upper_margins=cp_margins,
-        hoeffding_margin=float(math.sqrt(
-            math.log(1.0 / event_delta) / (2.0 * n_power))),
-        phase_pairs=phase_pairs, total_pairs=int(sum(phase_pairs.values())))
-
-
-def _common_is_budget_diagnostics(alpha, curve_confidence, common_grid_size,
-                                  n_nonnull, max_active_support, budget):
-    """Exact statistical ranks and logical-pair counts for the shared-bank path."""
+def _gkm_budget_diagnostics(alpha, common_grid_size, n_nonnull, budget):
+    """Exact logical-pair accounting for the direct GKM D.3.2 path."""
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("alpha must lie in (0,1)")
     H = _validated_integer("common_grid_size", common_grid_size)
     B = _validated_integer("n_nonnull", n_nonnull)
-    K = min(_validated_integer("max_active_support", max_active_support), H)
-    result = _simulation_budget_diagnostics(
-        alpha, curve_confidence, [H] * B, [H] * B, budget,
-        events_per_family=2)
+    n0 = _validated_integer("n_fit", budget["n_fit"], minimum=2)
+    n1 = _validated_integer("n_power", budget["n_power"], minimum=2)
+    n_iter = _validated_integer("n_iter", budget["n_iter"])
     phase_pairs = dict(
-        shared_fit_null=int(H * H * result['n_fit']),
-        fit_alternative=int(B * H * result['n_fit']),
-        calibration=int(B * (K + 1) * result['n_calibration']),
-        shared_audit_null=int(H * H * result['n_validation']),
-        audit_alternative=int(B * H * result['n_validation']),
-        power=int(B * (K + 1) * result['n_power']),
+        shared_null_bank=int(H * H * n0),
+        beta_training_alternative=int(B * H * n0),
+        beta_power=int(B * (H + 1) * n1),
     )
-    result.update(
-        common_is=True, common_grid_size=H, max_active_support=K,
-        pooled_observations=int(H * result['n_fit']),
+    return dict(
+        common_grid_size=H, n_nonnull=B, n_fit=n0, n_power=n1,
+        n_iter=n_iter, pooled_observations=int(H * n0),
+        null_tail_se_reference=float(
+            math.sqrt(alpha * (1.0 - alpha) / n0)),
+        power_se_at_half=float(0.5 / math.sqrt(n1)),
         phase_pairs=phase_pairs,
         total_pairs=int(sum(phase_pairs.values())))
-    return result
 
 
-def _print_simulation_budget_diagnostics(result, alpha, curve_confidence):
-    """Explain the statistical consequences of one requested curve budget."""
-    print("Statistical budget and confidence preflight:")
-    print(f"  simultaneous confidence {curve_confidence:.3%} covers the "
-          f"{result['n_nonnull']} computed non-null beta points only (not the "
-          "interpolated continuum)")
-    if result.get('events_per_family') == 2:
-        print(f"  per-beta failure allowance={result['point_delta']:.3g}; "
-              f"each of the 2 primary-upper events gets delta="
-              f"{result['event_delta']:.3g}")
-        print(f"  the finite-grid lower uses a separate 2-event family; the "
-              f"upper and lower jointly form at least a "
-              f"{result['grid_bracket_curve_confidence']:.3%} simultaneous "
-              "saved-grid bracket")
-    else:
-        print(f"  per-beta failure allowance={result['point_delta']:.3g}; "
-              f"each of 4 bracket events gets delta="
-              f"{result['event_delta']:.3g}")
-    if result.get('common_is'):
-        print(f"  fit: common H={result['common_grid_size']} strength/shape "
-              f"points, n_fit={result['n_fit']:,} per proposal "
-              f"({result['pooled_observations']:,} pooled observations); "
-              f"ordinary GKM importance sampling; active support capped at "
-              f"{result['max_active_support']}")
-        print(f"       nominal direct-tail SE reference="
-              f"{100 * result['fit_tail_se']:.3f} pp; actual IS precision is "
-              "reported by mass/ESS diagnostics; n_iter="
-              f"{result['n_iter']} reuses the bank")
-    else:
-        print(f"  fit: n_fit={result['n_fit']:,} per null, G="
-              f"{result['fit_grid_min']}--{result['fit_grid_max']}; nominal "
-              f"Bernoulli SE at alpha={100 * result['fit_tail_se']:.3f} pp; "
-              f"n_iter={result['n_iter']} (fit quality/tightness, not validity)")
-    print(f"  calibration: n_calibration={result['n_calibration']:,}; "
-          f"confidence-liberal rank rejects "
-          f"{result['calibration_rejection_count']:,}/"
-          f"{result['n_calibration']:,}="
-          f"{100 * result['calibration_empirical_size']:.3f}% "
-          f"({100 * result['calibration_inflation']:.3f} pp above alpha)")
-    for row in result['validation']:
-        print(f"  validation: n_validation={result['n_validation']:,} per null, "
-              f"V={row['V']}; confidence-conservative rank rejects "
-              f"{row['rejection_count']:,}/{result['n_validation']:,}="
-              f"{100 * row['empirical_size']:.3f}% "
-              f"({100 * row['deflation']:.3f} pp below alpha; affects only "
-              "the finite-grid lower endpoint/epsilon)")
-    print(f"  power: n_power={result['n_power']:,}; one-sided exact CP upper "
-          f"allowance is about {100 * result['cp_upper_margins'][alpha]:.3f} "
-          f"pp near power {alpha:.2f} and "
-          f"{100 * result['cp_upper_margins'][0.5]:.3f} pp near power 0.50; "
-          f"distribution-free Hoeffding ceiling="
-          f"{100 * result['hoeffding_margin']:.3f} pp")
-
-    if result['calibration_inflation'] > 0.01:
-        print("  WARNING: calibration confidence costs more than 1 percentage "
-              "point of null-size inflation; the upper can be quite loose.")
-    if max(row['deflation'] for row in result['validation']) > 0.01:
-        print("  WARNING: validation confidence costs more than 1 percentage "
-              "point of null-size deflation; the finite-grid lower endpoint "
-              "can be quite conservative (the EMW upper remains valid).")
-    if result['hoeffding_margin'] > 0.01:
-        print("  WARNING: n_power does not guarantee a <=1 percentage-point "
-              "one-sided Monte Carlo allowance in the worst case.")
-
-    total = result['total_pairs']
+def _print_gkm_budget_diagnostics(result, alpha):
+    print("Direct GKM D.3.2 simulation preflight:")
+    print(f"  common null grid H={result['common_grid_size']}; "
+          f"N0=n_fit={result['n_fit']:,} per null "
+          f"({result['pooled_observations']:,} pooled observations)")
+    print(f"  Step 5 uses mu0=-2, omega=2, and exactly "
+          f"O=n_iter={result['n_iter']} cached-table updates")
+    print(f"  N1=n_power={result['n_power']:,} fresh alternative draws per "
+          f"non-null beta; largest Bernoulli MC SE is about "
+          f"{100 * result['power_se_at_half']:.3f} pp")
+    print(f"  nominal direct-null tail SE reference at alpha={alpha:g} is "
+          f"{100 * result['null_tail_se_reference']:.3f} pp; actual ordinary-"
+          "IS precision depends on the saved mass and ESS diagnostics")
+    total = result["total_pairs"]
     phase_text = ", ".join(
         f"{name}={count:,} ({100.0 * count / total:.1f}%)"
-        for name, count in result['phase_pairs'].items())
+        for name, count in result["phase_pairs"].items())
     print(f"  density-pair cost by phase: {phase_text}")
-    if result.get('common_is'):
-        print("  The null-density training/audit tables are each computed once "
-              "and reused across every beta. Counts shown are for a fresh run; "
-              "a compatible cached table removes its corresponding cost. The "
-              "current top-K compression retains exactly the displayed active "
-              "support count for every non-null beta.")
-    print("  n_iter reuses fitted density tables and therefore adds no density "
-          "pairs. Adaptive M retries do add raw C evaluations.\n", flush=True)
+    print("  The null table is computed once and reused across beta values; "
+          "Step 6 and Step 8 reuse it. Adaptive-M retries add raw C "
+          "evaluations but not logical pairs.\n", flush=True)
+
+
 
 
 def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
@@ -3024,159 +2053,105 @@ def _print_mhg_benchmark(result):
           flush=True)
 
 
-def _run_scalar_smoke(budget, alpha, curve_confidence, seed,
-                      M_start, M_step, M_max, mhg_tol, n_workers):
-    """Fast end-to-end regression; deliberately produces no curve artifact."""
-    from scipy.stats import ncx2
 
-    print("Smoke profile: scalar p=1 EMW calibration regression")
-    print("  This checks the complete fit/calibration/confidence path and does "
-          "not write a p=4 bound artifact.")
-    verify_mhg()
-    result = alfd_eigval_bound(
-        (0.2,), [()], 7, alpha=alpha,
-        n_sim=budget['n_fit'],
-        n_sim_calibration=budget['n_calibration'],
-        n_sim_validation=budget['n_validation'],
-        n_sim_power=budget['n_power'], n_iter=budget['n_iter'],
-        M_trunc=M_start, M_step=M_step, M_max=M_max, mhg_tol=mhg_tol,
-        seed=seed, verbose=True, n_workers=n_workers,
-        confidence_delta=1.0 - curve_confidence, return_result=True)
-    exact = float(ncx2.sf(chi2.ppf(1.0 - alpha, 7), 7, 0.2))
-    if not np.isclose(result.point_rule.empirical_size, alpha, atol=5e-13):
-        raise RuntimeError("scalar smoke mixture calibration failed")
-    if result.upper_confidence + 1e-12 < exact:
-        raise RuntimeError(
-            "scalar smoke confidence endpoint missed the exact NP benchmark")
-    print(f"Smoke passed: exact NP={exact:.6f}, paper point="
-          f"{result.upper_point:.6f}, confidence upper="
-          f"{result.upper_confidence:.6f}. No artifact was written.")
+
 
 
 def main():
+    """Run the direct m_W=3 extension of GKM Supplement D.3.2."""
     import argparse
+
     parser = argparse.ArgumentParser(
         description=(
-            "Calibrated eigenvalue-density EMW bound with adaptive 0F1 "
-            "truncation and a GKM finite-grid epsilon check."))
-    parser.add_argument('--version', required=True, choices=list(VERSION_LABELS),
-                        help="config version label (" + ", ".join(VERSION_LABELS) + ")")
-    parser.add_argument('--profile', choices=('smoke', 'production', 'reference'),
-                        default='production',
-                        help="simulation budget; reference follows the papers' scale")
-    parser.add_argument('--force', action='store_true',
-                        help="overwrite an existing adaptive artifact")
-    preflight_mode = parser.add_mutually_exclusive_group()
-    preflight_mode.add_argument(
-        '--preflight-only', action='store_true',
-        help='print exact density-pair counts/runtime warning and exit')
-    preflight_mode.add_argument(
-        '--benchmark-preflight', action='store_true',
-        help=('time a short representative adaptive p=4 batch on this machine, '
-              'extrapolate the requested run, and exit without an artifact'))
+            "Direct GKM D.3.2 / EMW eigenvalue power-bound calculation for "
+            "m_W=3, with per-density adaptive 0F1 truncation."))
     parser.add_argument(
-        '--benchmark-samples', type=int, default=None,
-        help=('Xi samples for --benchmark-preflight; each is evaluated under '
-              'all fitted-null Omega rows and the full-rank alternative; '
-              'defaults to 64/16/2 '
-              'for easy/medium/strong configurations'))
+        "--version", required=True, choices=list(VERSION_LABELS),
+        help="configuration label (" + ", ".join(VERSION_LABELS) + ")")
     parser.add_argument(
-        '--acknowledge-expensive', action='store_true',
-        help='required before a production/reference p=4 curve is started')
-    parser.add_argument('--workers', type=int, default=None)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--m-start', type=int, default=None,
-                        help="minimum 0F1 degree; each call adapts upward")
-    parser.add_argument('--m-step', type=int, default=MHG_DEFAULT_STEP)
-    parser.add_argument('--m-max', type=int, default=MHG_DEFAULT_MAX)
-    parser.add_argument('--mhg-rtol', type=float, default=MHG_CONV_TOL)
-    parser.add_argument('--curve-confidence', type=float, default=0.99,
-                        help="simultaneous Monte Carlo confidence for the saved curve")
-    parser.add_argument('--n-fit', type=int, default=None)
-    parser.add_argument('--n-calibration', type=int, default=None)
-    parser.add_argument('--n-validation', type=int, default=None)
-    parser.add_argument('--n-power', type=int, default=None)
-    parser.add_argument('--n-iter', type=int, default=None)
+        "--profile", choices=("production", "reference"),
+        default="production",
+        help=("simulation scale; reference uses GKM's N0=10,000, "
+              "N1=100,000, O=600"))
     parser.add_argument(
-        '--validation-grid-size', type=int, default=None,
-        help=('deprecated for p=4; the common grid is controlled by '
-              '--grid-shapes and --grid-strengths'))
-    parser.add_argument('--grid-shapes', type=int, default=9,
-                        help=('common 3D nuisance-shape directions (default: 9; '
-                              'includes configured stress and rank-boundary shapes)'))
-    parser.add_argument('--grid-strengths', type=int, default=7,
-                        help='log-spaced strengths per direction (default: 7)')
-    parser.add_argument('--grid-max-strength', type=float, default=100.0,
-                        help='largest nuisance eigenvalue on common grid')
-    parser.add_argument('--max-active-support', type=int, default=8,
-                        help=('largest retained mixture support after fitting; '
-                              'the compressed mixture is independently recalibrated'))
+        "--force", action="store_true",
+        help="replace an incompatible completed direct-GKM artifact")
+    preflight = parser.add_mutually_exclusive_group()
+    preflight.add_argument(
+        "--preflight-only", action="store_true",
+        help="print exact direct-GKM density-pair counts and exit")
+    preflight.add_argument(
+        "--benchmark-preflight", action="store_true",
+        help="benchmark a representative adaptive p=4 density batch and exit")
+    parser.add_argument("--benchmark-samples", type=int, default=None)
     parser.add_argument(
-        '--beta-count', type=int, default=None,
-        help='saved beta-grid size (default: 11; ignored by scalar smoke)')
+        "--acknowledge-expensive", action="store_true",
+        help="required before starting a production/reference calculation")
+    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--m-start", type=int, default=None,
+                        help="minimum 0F1 degree; each density pair adapts upward")
+    parser.add_argument("--m-step", type=int, default=MHG_DEFAULT_STEP)
+    parser.add_argument("--m-max", type=int, default=MHG_DEFAULT_MAX)
+    parser.add_argument("--mhg-rtol", type=float, default=MHG_CONV_TOL)
+    parser.add_argument(
+        "--n-fit", type=int, default=None,
+        help="GKM N0 draws per common-grid null")
+    parser.add_argument(
+        "--n-power", type=int, default=None,
+        help="GKM N1 fresh alternative draws per non-null beta")
+    parser.add_argument(
+        "--n-iter", type=int, default=None,
+        help="GKM O fixed weight updates (paper value: 600)")
+    parser.add_argument(
+        "--grid-shapes", type=int, default=9,
+        help="common three-dimensional nuisance-shape directions")
+    parser.add_argument(
+        "--grid-strengths", type=int, default=7,
+        help="log-spaced strengths per direction")
+    parser.add_argument(
+        "--grid-max-strength", type=float, default=100.0)
+    parser.add_argument(
+        "--beta-count", type=int, default=9,
+        help="odd number of saved beta values on [-2,2] (default: 9)")
     args = parser.parse_args()
 
     k = 7
     n = 250
     alpha = 0.05
-
-    # ---- resolve config from the version label ----
     key = VERSION_LABELS[args.version]
     cfg = ALLOWED_CONFIGS[key]
-    M_start = cfg['M_start'] if args.m_start is None else args.m_start
-    standard_points = cfg['standard']
-    kappas = np.array(key, dtype=float)
-
+    kappas = np.asarray(key, dtype=float)
+    standard_points = cfg["standard"]
+    M_start = cfg["M_start"] if args.m_start is None else args.m_start
     profiles = {
-        # Smoke proves plumbing only; it is deliberately not a publication run.
-        # Fast p=1 regression only; it never writes a p=4 bound artifact.
-        'smoke': dict(n_fit=100, n_calibration=2000, n_validation=500,
-                      n_power=5000, n_iter=100, validation_grid_size=1),
-        # One well-calibrated run is statistically more useful than eight tiny,
-        # cycling 150-draw fits.  Confidence limits expose remaining MC error.
-        'production': dict(n_fit=2000, n_calibration=20000,
-                           n_validation=2000, n_power=50000, n_iter=600,
-                           validation_grid_size=32),
-        # GKM uses N0=10,000, N1=100,000 and 600 iterations.  Mixture
-        # calibration is separate here, so it also receives 100,000 draws.
-        'reference': dict(n_fit=10000, n_calibration=100000,
-                          n_validation=10000, n_power=100000, n_iter=600,
-                          validation_grid_size=42),
+        "production": dict(n_fit=2000, n_power=50000, n_iter=600),
+        "reference": dict(n_fit=10000, n_power=100000, n_iter=600),
     }
     budget = profiles[args.profile].copy()
-    for name, cli_value in (
-            ('n_fit', args.n_fit), ('n_calibration', args.n_calibration),
-            ('n_validation', args.n_validation), ('n_power', args.n_power),
-            ('n_iter', args.n_iter),
-            ('validation_grid_size', args.validation_grid_size)):
-        if cli_value is not None:
-            budget[name] = cli_value
-    for name in ('n_fit', 'n_calibration', 'n_validation', 'n_power'):
+    for name, value in (
+            ("n_fit", args.n_fit), ("n_power", args.n_power),
+            ("n_iter", args.n_iter)):
+        if value is not None:
+            budget[name] = value
+    for name in ("n_fit", "n_power"):
         if (not isinstance(budget[name], (int, np.integer))
+                or isinstance(budget[name], (bool, np.bool_))
                 or int(budget[name]) < 2):
             parser.error(f"--{name.replace('_', '-')} must be an integer >= 2")
-    for name in ('n_iter', 'validation_grid_size'):
-        if (not isinstance(budget[name], (int, np.integer))
-                or int(budget[name]) < 1):
-            parser.error(f"--{name.replace('_', '-')} must be a positive integer")
-    beta_count = args.beta_count if args.beta_count is not None else 11
-    if beta_count < 1:
-        parser.error("--beta-count must be positive")
-    if args.validation_grid_size is not None:
-        parser.error(
-            "--validation-grid-size was replaced by the common-grid controls "
-            "--grid-shapes and --grid-strengths")
+    if (not isinstance(budget["n_iter"], (int, np.integer))
+            or isinstance(budget["n_iter"], (bool, np.bool_))
+            or int(budget["n_iter"]) < 1):
+        parser.error("--n-iter must be a positive integer")
+    if args.beta_count < 3 or args.beta_count % 2 != 1:
+        parser.error("--beta-count must be an odd integer >= 3 so beta=0 is saved")
     if args.grid_shapes < 1 or args.grid_strengths < 1:
         parser.error("--grid-shapes and --grid-strengths must be positive")
     if (not np.isfinite(args.grid_max_strength)
             or args.grid_max_strength <= 0.1):
         parser.error("--grid-max-strength must be finite and greater than 0.1")
-    if args.max_active_support < 1:
-        parser.error("--max-active-support must be positive")
     if args.seed < 0:
         parser.error("--seed must be nonnegative")
-    if not (0.0 < args.curve_confidence < 1.0):
-        parser.error("--curve-confidence must lie in (0,1)")
     if not (1 <= M_start <= args.m_max) or args.m_step < 1:
         parser.error("require 1 <= --m-start <= --m-max and --m-step >= 1")
     if not np.isfinite(args.mhg_rtol) or not (1e-13 <= args.mhg_rtol < 1.0):
@@ -3188,277 +2163,198 @@ def main():
             parser.error(
                 "--benchmark-samples must lie in "
                 f"[1, {MHG_MAX_BENCHMARK_SAMPLES}]")
-    # High-order p=4 work arrays are large.  Keep automatic parallelism
-    # conservative; explicit --workers remains available after the user checks
-    # the machine's memory budget.
     n_workers = (args.workers if args.workers is not None
                  else min(os.cpu_count() or 1, 16))
     if n_workers < 1:
         parser.error("--workers must be positive")
 
-    if args.profile == 'smoke':
-        if args.benchmark_preflight:
-            parser.error(
-                "--benchmark-preflight requires profile=production or "
-                "reference; smoke is a scalar-only regression")
-        if args.preflight_only:
-            print("Smoke preflight: the exact scalar EMW regression uses the "
-                  f"fixed smoke budgets {budget} and writes no p=4 artifact.")
-            return
-        _run_scalar_smoke(
-            budget, alpha, args.curve_confidence, args.seed,
-            M_start, args.m_step, args.m_max, args.mhg_rtol, 1)
-        return
-
-    betas_alfd = np.linspace(-2.0, 2.0, int(beta_count))
-    n_betas = len(betas_alfd)
-    ncp_table = np.empty((n_betas, len(kappas) + 1))
-    for i, beta_value in enumerate(betas_alfd):
-        ncp_table[i] = np.maximum(
-            asymptotic_ncp_eigenvalues(beta_value, kappas, k, n), 0.0)
-    # In this DGP beta=0 is analytically rank deficient.  Do not classify a
-    # nearby alternative as null using a floating-point eigenvalue tolerance.
-    nonnull = betas_alfd != 0.0
-    point_delta = ((1.0 - args.curve_confidence)
-                   / max(1, int(np.count_nonzero(nonnull))))
-
+    betas = np.linspace(-2.0, 2.0, int(args.beta_count))
+    ncp_table = np.asarray([
+        np.maximum(asymptotic_ncp_eigenvalues(b, kappas, k, n), 0.0)
+        for b in betas])
+    nonnull = betas != 0.0
+    # The nuisance grid is part of the statistical design, not a side effect
+    # of how densely the displayed beta curve is sampled.  Derive its two
+    # path-dependent shape directions from one fixed dense design path so
+    # changing --beta-count changes curve resolution only.
+    grid_design_betas = np.linspace(
+        -2.0, 2.0, GRID_DESIGN_BETA_COUNT)
+    grid_design_nuisance = np.asarray([
+        np.maximum(
+            asymptotic_ncp_eigenvalues(b, kappas, k, n), 0.0)[:-1]
+        for b in grid_design_betas])
     common_grid = common_null_grid_3d(
-        ncp_table[:, :-1], kappas, standard_points=standard_points,
-        n_shapes=args.grid_shapes,
-        n_strengths=args.grid_strengths,
+        grid_design_nuisance, kappas, standard_points=standard_points,
+        n_shapes=args.grid_shapes, n_strengths=args.grid_strengths,
         max_strength=args.grid_max_strength)
-    H_common = len(common_grid)
-    grid_anchor_count = H_common - (1 + args.grid_shapes * args.grid_strengths)
+    H = len(common_grid)
+    grid_anchor_count = H - (1 + args.grid_shapes * args.grid_strengths)
     if not (0 <= grid_anchor_count <= len(standard_points)):
         raise AssertionError("unexpected common-grid anchor count")
-    active_cap = min(args.max_active_support, H_common)
-    logical_pairs_by_beta = np.zeros(n_betas, dtype=np.int64)
-    per_beta_variable = (
-        H_common * (budget['n_fit'] + budget['n_validation'])
-        + (active_cap + 1)
-        * (budget['n_calibration'] + budget['n_power']))
-    logical_pairs_by_beta[nonnull] = per_beta_variable
-    nonnull_indices = np.flatnonzero(nonnull)
-    if nonnull_indices.size:
-        try:
-            budget_diagnostics = _common_is_budget_diagnostics(
-                alpha, args.curve_confidence, H_common,
-                int(nonnull_indices.size), active_cap, budget)
-        except ValueError as exc:
-            parser.error(f"invalid statistical budget: {exc}")
-        total_logical_pairs = budget_diagnostics['total_pairs']
-        _print_simulation_budget_diagnostics(
-            budget_diagnostics, alpha, args.curve_confidence)
-    else:
-        budget_diagnostics = None
-        total_logical_pairs = 0
-        print("Statistical budget preflight: beta grid contains only the exact "
-              "null, so no Monte Carlo density evaluations are needed.\n")
+    B = int(np.count_nonzero(nonnull))
+    try:
+        budget_diagnostics = _gkm_budget_diagnostics(
+            alpha, H, B, budget)
+    except ValueError as exc:
+        parser.error(f"invalid direct-GKM simulation budget: {exc}")
+    total_logical_pairs = budget_diagnostics["total_pairs"]
+    _print_gkm_budget_diagnostics(budget_diagnostics, alpha)
 
     representative_pair_seconds = {
         (35, 25, 15): 0.123,
         (100, 30, 15): 0.827,
         (100, 95, 90): 31.1,
     }[key]
-    optimistic_serial = total_logical_pairs * representative_pair_seconds
-    optimistic_parallel = optimistic_serial / n_workers
+    serial_estimate = total_logical_pairs * representative_pair_seconds
+    parallel_lower = serial_estimate / n_workers
     print("Preflight computational scale:")
-    print(f"  logical density pairs: {total_logical_pairs:,} over "
-          f"{int(np.count_nonzero(nonnull))} non-null betas")
+    print(f"  logical density pairs: {total_logical_pairs:,} over {B} "
+          "non-null betas")
     print(f"  prior developer-machine representative pair: "
           f"~{representative_pair_seconds:g} s; indicative serial "
-          f"extrapolation: {_format_duration(optimistic_serial)}")
+          f"extrapolation: {_format_duration(serial_estimate)}")
     print(f"  optimistic perfect-{n_workers}-way lower bound: "
-          f"{_format_duration(optimistic_parallel)}")
+          f"{_format_duration(parallel_lower)}")
     if key == (100, 95, 90):
-        print("  WARNING: strong validation-grid pairs have exceeded 150 s each; "
-              "the extrapolation above is materially optimistic.")
-    print("  Adaptive retries add raw C evaluations; actual multiprocessing "
-          "scaling is sublinear. Use --benchmark-preflight for a measurement "
-          "on the machine that will run the job.\n", flush=True)
+        print("  WARNING: strong-grid pairs can be materially slower than "
+              "this representative extrapolation.")
+    print("  Adaptive retries add raw C evaluations and multiprocessing "
+          "scaling is sublinear. Use --benchmark-preflight on the target "
+          "machine.\n", flush=True)
     if args.preflight_only:
         print("Preflight only; no simulation or artifact write was performed.")
         return
     if args.benchmark_preflight:
-        if not nonnull_indices.size:
-            parser.error("--benchmark-preflight needs at least one non-null beta")
-        benchmark_samples = (args.benchmark_samples
-                             if args.benchmark_samples is not None
-                             else MHG_DEFAULT_BENCHMARK_SAMPLES[key])
-        benchmark = _benchmark_adaptive_mhg(
-            ncp_table, betas_alfd, total_logical_pairs, k,
+        sample_count = (args.benchmark_samples
+                        if args.benchmark_samples is not None
+                        else MHG_DEFAULT_BENCHMARK_SAMPLES[key])
+        result = _benchmark_adaptive_mhg(
+            ncp_table, betas, total_logical_pairs, k,
             M_start, args.m_step, args.m_max, args.mhg_rtol,
-            n_workers, benchmark_samples,
-            fit_grids=[common_grid for _ in range(n_betas)])
-        _print_mhg_benchmark(benchmark)
+            n_workers, sample_count,
+            fit_grids=[common_grid for _ in range(len(betas))])
+        _print_mhg_benchmark(result)
         return
+    if not args.acknowledge_expensive:
+        parser.error(
+            "production/reference runs require --acknowledge-expensive; "
+            "inspect the preflight estimate first")
 
-    # Corrected artifacts live in a new namespace and cannot collide with the
-    # legacy fixed-M/pre-calibration files.
-    out_dir = os.path.join(args.version, "adaptive")
-    out_npz = os.path.join(out_dir, f"alfd_eigval_{args.version}.npz")
+    out_dir = os.path.join(args.version, "gkm_direct")
+    out_npz = os.path.join(out_dir, f"gkm_eigval_{args.version}.npz")
     partial_npz = os.path.join(
-        out_dir, f"alfd_eigval_{args.version}.partial.npz")
-    out_png = os.path.join(out_dir, f"alfd_eigval_{args.version}.png")
+        out_dir, f"gkm_eigval_{args.version}.partial.npz")
     source_path = os.path.abspath(__file__)
-    lib_name = 'libmhg.dylib' if sys.platform == 'darwin' else 'libmhg.so'
+    lib_name = "libmhg.dylib" if sys.platform == "darwin" else "libmhg.so"
     provenance = dict(
         schema_version=RESULT_SCHEMA_VERSION,
         algorithm=ALGORITHM_VERSION,
         producer=os.path.basename(source_path),
         calibration_method=CALIBRATION_METHOD,
         source_sha256=_sha256_file(source_path),
-        mhg_core_sha256=_sha256_file(os.path.join(MHG_DIR, 'mhg_core.c')),
+        mhg_core_sha256=_sha256_file(os.path.join(MHG_DIR, "mhg_core.c")),
         mhg_library_sha256=_sha256_file(os.path.join(MHG_DIR, lib_name)),
         mhg_build_source_sha256=_verify_mhg_build_provenance(
             MHG_DIR, lib_name),
         python_version=sys.version,
-        numpy_version=np.__version__,
-        scipy_version=scipy.__version__,
-        platform=platform.platform(),
-    )
-    training_bank_seed = int(np.random.SeedSequence(
-        [args.seed, 0x47534B4D]).generate_state(1, dtype=np.uint32)[0])
-    audit_bank_seed = int(np.random.SeedSequence(
-        [args.seed, 0x41554449]).generate_state(1, dtype=np.uint32)[0])
+        numpy_version=np.__version__, scipy_version=scipy.__version__,
+        platform=platform.platform())
+    bank_seed = int(np.random.SeedSequence(
+        [args.seed, 0x474B4D34]).generate_state(1, dtype=np.uint32)[0])
     run_settings = dict(
         version_label=args.version, kappas=kappas.tolist(), k=k, n=n,
         alpha=alpha, profile=args.profile, seed=args.seed,
         M_start=M_start, M_step=args.m_step, M_max=args.m_max,
-        mhg_rtol=args.mhg_rtol, curve_confidence=args.curve_confidence,
-        beta_count=beta_count,
+        mhg_rtol=args.mhg_rtol, beta_count=int(args.beta_count),
         fit_grid_strategy=COMMON_GRID_METHOD,
         pooled_importance_method=POOLED_IS_METHOD,
-        confidence_allocation_method=CONFIDENCE_ALLOCATION_METHOD,
         common_grid=common_grid,
+        grid_design_beta_count=GRID_DESIGN_BETA_COUNT,
         grid_shapes=args.grid_shapes,
         grid_strengths=args.grid_strengths,
         grid_max_strength=args.grid_max_strength,
         grid_anchor_count=grid_anchor_count,
-        max_active_support=active_cap,
-        training_bank_seed=training_bank_seed,
-        audit_bank_seed=audit_bank_seed,
-        n_fit=budget['n_fit'],
-        n_calibration=budget['n_calibration'],
-        n_validation=budget['n_validation'],
-        n_power=budget['n_power'], n_iter=budget['n_iter'],
+        bank_seed=bank_seed,
+        n_fit=int(budget["n_fit"]), n_power=int(budget["n_power"]),
+        n_iter=int(budget["n_iter"]),
+        gkm_initial_mu=-2.0, gkm_step_size=2.0,
         **provenance)
     run_signature = hashlib.sha256(json.dumps(
-        run_settings, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        run_settings, sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest()
 
     if os.path.isfile(out_npz) and not args.force:
         try:
             with np.load(out_npz, allow_pickle=False) as existing:
-                saved_signature = str(existing['run_signature'].item())
+                saved_signature = str(existing["run_signature"].item())
         except (OSError, KeyError, ValueError) as exc:
             raise RuntimeError(
-                f"Existing artifact {out_npz} has no trustworthy provenance "
-                f"({exc}). Use --force to replace it explicitly.") from exc
+                f"Existing artifact {out_npz} lacks trustworthy provenance "
+                f"({exc}). Move it aside or use --force explicitly.") from exc
         if saved_signature == run_signature:
             print(f"Compatible result already present: {out_npz}\nNothing to do.")
             return
         raise RuntimeError(
-            f"Existing artifact {out_npz} was produced with different code or "
-            "settings. It will not be loaded or overwritten silently. Re-run "
-            "with --force to replace it, or move it aside.")
+            f"Existing artifact {out_npz} has different code/settings. "
+            "Move it aside or use --force explicitly.")
 
-    if not args.acknowledge_expensive:
-        parser.error(
-            "production/reference p=4 runs require --acknowledge-expensive; "
-            "inspect the preflight estimate above first")
     os.makedirs(out_dir, exist_ok=True)
-
-    # Tee all console output into <out_dir>/run.log so the log lives with the
-    # results. Workers don't print (the parent does), so this is fork/spawn safe.
-    _log_fh = open(os.path.join(out_dir, "bound_run.log"), "a", buffering=1)
-    sys.stdout = _Tee(sys.stdout, _log_fh)
-    sys.stderr = _Tee(sys.stderr, _log_fh)
+    log_handle = open(
+        os.path.join(out_dir, "bound_run.log"), "a", buffering=1)
+    sys.stdout = _Tee(sys.stdout, log_handle)
+    sys.stderr = _Tee(sys.stderr, log_handle)
     print(f"Logging to {os.path.join(out_dir, 'bound_run.log')}")
-
     verify_mhg()
+    print(f"Version {args.version}: k={k}, kappas={kappas.tolist()}, "
+          f"n={n}, alpha={alpha}")
+    print(f"  direct GKM D.3.2: H={H}, N0={budget['n_fit']:,}, "
+          f"N1={budget['n_power']:,}, O={budget['n_iter']}")
+    print(f"  full H-point mixture retained; no compression, audit split, "
+          "or confidence correction")
+    print(f"  adaptive M: start={M_start}, step={args.m_step}, "
+          f"max={args.m_max}, rtol={args.mhg_rtol:.1e}; "
+          f"workers={n_workers}")
+    print(f"  beta grid: {len(betas)} points in [{betas[0]:+.2f}, "
+          f"{betas[-1]:+.2f}]; run signature={run_signature}\n", flush=True)
 
-    print(f"Version {args.version}: k={k}, kappas={kappas.tolist()}, n={n}, alpha={alpha}")
-    print(f"  output dir: {out_dir}/")
-    print(f"  betas: {len(betas_alfd)} in [{betas_alfd[0]:+.2f}, {betas_alfd[-1]:+.2f}]")
-    print(f"  adaptive M: start={M_start}, step={args.m_step}, max={args.m_max}, "
-          f"rtol={args.mhg_rtol:.1e}; parallelism={n_workers}")
-    print(f"  common null grid: H={H_common} = origin + "
-          f"{args.grid_shapes} shapes x {args.grid_strengths} strengths; "
-          f"{grid_anchor_count} additional exact stress anchors; maximum "
-          f"strength={args.grid_max_strength:g}")
-    print(f"  active mixture support cap={active_cap}; pooled method="
-          f"{POOLED_IS_METHOD}")
-    print(f"  profile={args.profile}, seed={args.seed}, budgets={budget}")
-    print(f"  simultaneous MC confidence={args.curve_confidence:.3%}")
-    print(f"  acknowledged preflight: {total_logical_pairs:,} logical pairs; "
-          f"optimistic perfect-{n_workers}-way estimate "
-          f"{_format_duration(optimistic_parallel)}")
-    print(f"  run signature={run_signature}\n")
-
-    t_total = time.time()
-
-    bounds_confidence = np.full(n_betas, np.nan)
-    bounds_point = np.full(n_betas, np.nan)
-    bounds_point_se = np.full(n_betas, np.nan)
-    lower_grid_point = np.full(n_betas, np.nan)
-    lower_grid_confidence = np.full(n_betas, np.nan)
-    epsilon_grid_point = np.full(n_betas, np.nan)
-    epsilon_grid_confidence = np.full(n_betas, np.nan)
-    benchmark_power = np.full(n_betas, np.nan)
-    benchmark_se = np.full(n_betas, np.nan)
-    benchmark_lower_confidence = np.full(n_betas, np.nan)
-    fit_residual = np.full(n_betas, np.nan)
-    fit_converged = np.zeros(n_betas, dtype=bool)
-    fit_iterations = np.zeros(n_betas, dtype=int)
-    max_validation_rp = np.full(n_betas, np.nan)
-    max_m_used = np.zeros(n_betas, dtype=int)
-    active_support_count = np.zeros(n_betas, dtype=int)
-    discarded_weight_mass = np.full(n_betas, np.nan)
-    gkm_point_upper = np.full(n_betas, np.nan)
-    gkm_grid_lower = np.full(n_betas, np.nan)
-    gkm_epsilon = np.full(n_betas, np.nan)
-    fitted_weights_full = np.full((n_betas, H_common), np.nan)
-    retained_weights = np.full((n_betas, active_cap), np.nan)
-    retained_indices = np.full((n_betas, active_cap), -1, dtype=int)
-    diagnostics_json = np.full(n_betas, '', dtype='<U100000')
-
+    bounds = np.full(len(betas), np.nan)
+    bounds_se = np.full(len(betas), np.nan)
+    mixture_power = np.full(len(betas), np.nan)
+    mixture_power_se = np.full(len(betas), np.nan)
+    epsilon_grid = np.full(len(betas), np.nan)
+    fitted_weights = np.full((len(betas), H), np.nan)
+    fitted_log_weights = np.full((len(betas), H), np.nan)
+    fit_rejection_probabilities = np.full((len(betas), H), np.nan)
+    grid_rejection_probabilities = np.full((len(betas), H), np.nan)
+    fit_iterations = np.zeros(len(betas), dtype=int)
+    max_m_used = np.zeros(len(betas), dtype=int)
+    diagnostics_json = np.full(len(betas), "", dtype="<U100000")
     checkpoint_arrays = dict(
-        bounds_confidence=bounds_confidence, bounds_point=bounds_point,
-        bounds_point_se=bounds_point_se, lower_grid_point=lower_grid_point,
-        lower_grid_confidence=lower_grid_confidence,
-        epsilon_grid_point=epsilon_grid_point,
-        epsilon_grid_confidence=epsilon_grid_confidence,
-        benchmark_power=benchmark_power, benchmark_se=benchmark_se,
-        benchmark_lower_confidence=benchmark_lower_confidence,
-        fit_residual=fit_residual, fit_converged=fit_converged,
-        fit_iterations=fit_iterations,
-        max_validation_rp=max_validation_rp, max_m_used=max_m_used,
-        active_support_count=active_support_count,
-        discarded_weight_mass=discarded_weight_mass,
-        gkm_point_upper=gkm_point_upper,
-        gkm_grid_lower=gkm_grid_lower, gkm_epsilon=gkm_epsilon,
-        fitted_weights_full=fitted_weights_full,
-        retained_weights=retained_weights,
-        retained_indices=retained_indices,
+        bounds=bounds, bounds_se=bounds_se,
+        mixture_power=mixture_power,
+        mixture_power_se=mixture_power_se,
+        epsilon_grid=epsilon_grid,
+        fitted_weights=fitted_weights,
+        fitted_log_weights=fitted_log_weights,
+        fit_rejection_probabilities=fit_rejection_probabilities,
+        grid_rejection_probabilities=grid_rejection_probabilities,
+        fit_iterations=fit_iterations, max_m_used=max_m_used,
         diagnostics_json=diagnostics_json)
     checkpoint_metadata = dict(
         schema_version=np.array(RESULT_SCHEMA_VERSION),
         algorithm=np.array(ALGORITHM_VERSION),
-        producer=np.array('alfd_eigval.py'),
+        producer=np.array("alfd_eigval.py"),
         calibration_method=np.array(CALIBRATION_METHOD),
-        confidence_allocation_method=np.array(
-            CONFIDENCE_ALLOCATION_METHOD),
         bound_kind=np.array(BOUND_KIND),
         version_label=np.array(args.version),
         run_signature=np.array(run_signature),
         settings_json=np.array(json.dumps(run_settings, sort_keys=True)),
-        kappas=np.asarray(kappas, dtype=float),
-        k=np.array(k), n=np.array(n), alpha=np.array(alpha),
-        curve_confidence=np.array(args.curve_confidence))
+        kappas=kappas, k=np.array(k), n=np.array(n), alpha=np.array(alpha))
+
     if os.path.isfile(partial_npz) and not args.force:
         try:
             with np.load(partial_npz, allow_pickle=False) as checkpoint:
-                if str(checkpoint['run_signature'].item()) != run_signature:
+                if str(checkpoint["run_signature"].item()) != run_signature:
                     raise ValueError("run signature differs")
                 for name, destination in checkpoint_arrays.items():
                     saved = checkpoint[name]
@@ -3467,259 +2363,122 @@ def main():
                     destination[...] = saved
         except (OSError, KeyError, ValueError) as exc:
             raise RuntimeError(
-                f"Cannot resume checkpoint {partial_npz}: {exc}. Use --force "
-                "to start this adaptive run again.") from exc
-        print(f"  resumed {np.count_nonzero(np.isfinite(bounds_confidence))}/"
-              f"{n_betas} beta points from {partial_npz}")
-
-    # Publish an authenticated, all-NaN (or resumed) checkpoint before the
-    # shared-bank construction begins.  A read-only progress watcher can then
-    # display the cached feasible curves immediately without importing W&B or
-    # any network state into this numerical multiprocessing process.
+                f"Cannot resume checkpoint {partial_npz}: {exc}. Move it "
+                "aside or use --force to replace this run.") from exc
+        print(f"  resumed {np.count_nonzero(np.isfinite(bounds))}/"
+              f"{len(betas)} beta points from {partial_npz}")
     _atomic_savez(
-        partial_npz, **checkpoint_metadata,
-        betas=betas_alfd, ncp=ncp_table,
-        **{name: value for name, value in checkpoint_arrays.items()})
+        partial_npz, **checkpoint_metadata, betas=betas, ncp=ncp_table,
+        **checkpoint_arrays)
 
-    # These beta-invariant null tables are the principal GKM computational
-    # reuse.  Their cache keys authenticate the grid, RNG stream, adaptive-M
-    # settings and current density implementation.
-    training_bank = build_or_load_pooled_is_bank(
-        common_grid, k, budget['n_fit'], training_bank_seed,
+    bank = build_or_load_pooled_is_bank(
+        common_grid, k, budget["n_fit"], bank_seed,
         M_start=M_start, M_step=args.m_step, M_max=args.m_max,
-        mhg_tol=args.mhg_rtol, n_workers=n_workers, role="training",
-        cache_dir=out_dir, cache_metadata=provenance)
-    audit_bank = build_or_load_pooled_is_bank(
-        common_grid, k, budget['n_validation'], audit_bank_seed,
-        M_start=M_start, M_step=args.m_step, M_max=args.m_max,
-        mhg_tol=args.mhg_rtol, n_workers=n_workers, role="audit",
+        mhg_tol=args.mhg_rtol, n_workers=n_workers, role="gkm",
         cache_dir=out_dir, cache_metadata=provenance)
 
+    start_total = time.time()
     beta_times = []
-
-    for i, b in enumerate(betas_alfd):
-        if np.isfinite(bounds_confidence[i]):
-            print(f"========== beta {i+1}/{n_betas} = {b:+.2f}: "
-                  "loaded from compatible checkpoint ==========", flush=True)
+    for i, beta_value in enumerate(betas):
+        if np.isfinite(bounds[i]):
+            print(f"========== beta {i + 1}/{len(betas)} = "
+                  f"{beta_value:+.2f}: loaded from checkpoint ==========",
+                  flush=True)
             continue
-        t0 = time.time()
-        header = (f"========== beta {i+1}/{n_betas} = {b:+.2f}  "
-                  f"(elapsed total: {(time.time()-t_total)/60:.1f} min)")
-        if beta_times:
-            avg = np.mean(beta_times)
-            eta = avg * (n_betas - i)
-            header += f"  ETA for remainder: {eta/60:.1f} min"
-        header += " =========="
-        print(header, flush=True)
-
+        start_beta = time.time()
+        print(f"========== beta {i + 1}/{len(betas)} = {beta_value:+.2f} "
+              f"(total elapsed {(start_beta - start_total) / 60:.1f} min) "
+              "==========", flush=True)
         ncp = ncp_table[i]
-        ncp_str = "[" + ", ".join(f"{x:5.2f}" for x in ncp) + "]"
         exact_null = not nonnull[i]
         beta_seed = None
         if exact_null:
-            print(f"  NCP={ncp_str}; exact rank-deficient alternative -> "
-                  f"randomized bound alpha={alpha}", flush=True)
-            result = _exact_null_result(alpha, H_common, common_grid)
+            print("  exact rank-deficient alternative: randomized power "
+                  f"equals alpha={alpha}", flush=True)
+            result = _exact_gkm_result(alpha, H)
         else:
-            print(f"  NCP={ncp_str}; common grid H={H_common}; "
-                  f"active support cap={active_cap}; beta-specific logical "
-                  f"density pairs={logical_pairs_by_beta[i]:,}",
-                  flush=True)
             beta_seed = int(np.random.SeedSequence(
                 [args.seed, 0x42455441, i]).generate_state(
                     1, dtype=np.uint32)[0])
-            result = alfd_eigval_bound_from_pooled_banks(
-                kappas_alt=tuple(ncp), training_bank=training_bank,
-                audit_bank=audit_bank, k_eff=k, alpha=alpha,
-                n_sim_calibration=budget['n_calibration'],
-                n_sim_power=budget['n_power'], n_iter=budget['n_iter'],
-                max_active_support=active_cap,
+            if beta_seed == bank_seed:
+                beta_seed = (beta_seed + 1) % (2 ** 32)
+            print("  NCP=[" + ", ".join(f"{x:.4f}" for x in ncp)
+                  + f"]; full GKM support H={H}", flush=True)
+            result = gkm_eigval_bound_from_pooled_bank(
+                kappas_alt=ncp, bank=bank, k_eff=k, alpha=alpha,
+                n_sim_power=budget["n_power"], n_iter=budget["n_iter"],
+                seed=beta_seed, verbose=True, n_workers=n_workers,
                 M_trunc=M_start, M_step=args.m_step, M_max=args.m_max,
-                mhg_tol=args.mhg_rtol, seed=beta_seed,
-                verbose=True, n_workers=n_workers,
-                confidence_delta=point_delta)
+                mhg_tol=args.mhg_rtol)
 
-        bounds_confidence[i] = result.upper_confidence
-        bounds_point[i] = result.upper_point
-        bounds_point_se[i] = result.upper_point_se
-        lower_grid_point[i] = result.lower_grid_point
-        lower_grid_confidence[i] = result.lower_grid_confidence
-        epsilon_grid_point[i] = result.epsilon_grid_point
-        epsilon_grid_confidence[i] = result.epsilon_grid_confidence
-        benchmark_power[i] = result.invariant_benchmark_power
-        benchmark_se[i] = result.invariant_benchmark_se
-        benchmark_lower_confidence[i] = (
-            result.invariant_benchmark_lower_confidence)
-        fit_residual[i] = result.fit_complementarity_residual
-        fit_converged[i] = result.fit_converged
+        bounds[i] = result.bound
+        bounds_se[i] = result.bound_se
+        mixture_power[i] = result.mixture_power
+        mixture_power_se[i] = result.mixture_power_se
+        epsilon_grid[i] = result.epsilon_grid
+        fitted_weights[i] = result.weights
+        fitted_log_weights[i] = result.log_weights
+        fit_rejection_probabilities[i] = result.fit_rejection_probabilities
+        grid_rejection_probabilities[i] = result.grid_rejection_probabilities
         fit_iterations[i] = result.fit_iterations
-        max_validation_rp[i] = float(np.max(result.validation_rejection_probabilities))
-        max_m_used[i] = int(result.mhg_diagnostics['max_order'])
-        active_support_count[i] = (0 if exact_null else len(result.weights))
-        discarded_weight_mass[i] = result.discarded_weight_mass
-        gkm_point_upper[i] = result.gkm_point_upper
-        gkm_grid_lower[i] = result.gkm_grid_lower
-        gkm_epsilon[i] = result.gkm_epsilon
-        if result.full_weights is not None:
-            if np.asarray(result.full_weights).shape != (H_common,):
-                raise RuntimeError("fitted full-weight vector has wrong shape")
-            fitted_weights_full[i] = result.full_weights
-        if not exact_null:
-            count = active_support_count[i]
-            retained_weights[i, :count] = result.weights
-            retained_indices[i, :count] = result.active_indices
+        max_m_used[i] = int(result.mhg_diagnostics["max_order"])
         diagnostic_record = json.dumps(_json_safe(dict(
-            weights=result.weights,
-            certification_seed=beta_seed,
-            full_weights=result.full_weights,
-            active_indices=result.active_indices,
-            active_null_grid=result.active_null_grid,
-            discarded_weight_mass=result.discarded_weight_mass,
-            fit_rejection_probabilities=result.fit_rejection_probabilities,
-            point_rule=result.point_rule,
-            upper_confidence_rule=result.upper_confidence_rule,
-            lower_grid_rule=result.lower_grid_rule,
-            lower_grid_confidence_rule=result.lower_grid_confidence_rule,
-            calibration_component_counts=result.calibration_component_counts,
-            validation_rejection_probabilities=result.validation_rejection_probabilities,
-            gkm_point_upper=result.gkm_point_upper,
-            gkm_grid_lower=result.gkm_grid_lower,
-            gkm_epsilon=result.gkm_epsilon,
+            power_seed=beta_seed,
+            mixture_rule=result.mixture_rule,
+            grid_rule=result.grid_rule,
             importance=result.importance_diagnostics,
-            grid_bracket_confidence_level=(
-                result.grid_bracket_confidence_level),
             mhg=result.mhg_diagnostics)), sort_keys=True)
         if len(diagnostic_record) > diagnostics_json.dtype.itemsize // 4:
             raise RuntimeError(
-                "per-beta diagnostic JSON exceeds the checkpoint field; "
-                "increase its declared width rather than truncating it")
+                "per-beta diagnostic JSON exceeds its checkpoint field")
         diagnostics_json[i] = diagnostic_record
-
         _atomic_savez(
-            partial_npz, **checkpoint_metadata,
-            betas=betas_alfd, ncp=ncp_table,
-            **{name: value for name, value in checkpoint_arrays.items()})
+            partial_npz, **checkpoint_metadata, betas=betas, ncp=ncp_table,
+            **checkpoint_arrays)
 
-        elapsed = time.time() - t0
+        elapsed = time.time() - start_beta
         beta_times.append(elapsed)
-        avg = np.mean(beta_times)
-        eta = avg * (n_betas - (i + 1))
-        print(f"  -> paper point={bounds_point[i]:.5f} +/- {bounds_point_se[i]:.5f}; "
-              f"simultaneous-MC upper conditional on density accuracy="
-              f"{bounds_confidence[i]:.5f}")
-        print(f"     finite-grid lower={lower_grid_point[i]:.5f}; "
-              f"epsilon={epsilon_grid_point[i]:.5f}; max M={max_m_used[i]}")
-        if not exact_null:
-            print(f"     active support={active_support_count[i]}/{H_common}; "
-                  f"discarded fitted mass={discarded_weight_mass[i]:.3e}; "
-                  f"GKM reused-bank epsilon={gkm_epsilon[i]:.5f}")
-        print(f"     (this beta: {elapsed:.0f}s = {elapsed/60:.1f} min; "
-              f"avg {avg:.0f}s/beta; ETA remainder: {eta/60:.1f} min)\n",
-              flush=True)
+        remaining = int(np.count_nonzero(~np.isfinite(bounds)))
+        eta = float(np.mean(beta_times) * remaining) if beta_times else 0.0
+        print(f"  -> GKM Figure-3 bound tilde(pi)={bounds[i]:.5f} "
+              f"+/- {bounds_se[i]:.5f} MC SE; bar(pi)="
+              f"{mixture_power[i]:.5f}; epsilon={epsilon_grid[i]:.5f}; "
+              f"max M={max_m_used[i]}")
+        print(f"     beta runtime={elapsed / 60:.1f} min; "
+              f"ETA={eta / 60:.1f} min\n", flush=True)
 
-    total_elapsed = time.time() - t_total
-    print(f"\n=== Total runtime: {total_elapsed/60:.1f} min ===")
-    print("Results (paper point; simultaneous-MC upper conditional on density accuracy):")
-    for i, b in enumerate(betas_alfd):
-        print(f"  beta={b:+.2f}: point={bounds_point[i]:.5f} +/- "
-              f"{bounds_point_se[i]:.5f}; upper={bounds_confidence[i]:.5f}; "
-              f"grid epsilon={epsilon_grid_point[i]:.5f}")
+    total_elapsed = time.time() - start_total
+    print(f"\n=== Direct GKM total loop runtime: {total_elapsed / 60:.1f} min ===")
+    for beta_value, bound, se, bar, epsilon in zip(
+            betas, bounds, bounds_se, mixture_power, epsilon_grid):
+        print(f"  beta={beta_value:+.2f}: tilde(pi)={bound:.5f} +/- "
+              f"{se:.5f}; bar(pi)={bar:.5f}; epsilon={epsilon:.5f}")
 
-    # `bounds` is intentionally the confidence-valid curve.  `bounds_se` is
-    # zero because this endpoint already includes its one-sided MC allowance;
-    # the paper-style estimate and its SE are saved under explicit names.
     save_payload = dict(
-        schema_version=np.array(RESULT_SCHEMA_VERSION),
-        algorithm=np.array(ALGORITHM_VERSION), producer=np.array('alfd_eigval.py'),
-        calibration_method=np.array(CALIBRATION_METHOD),
-        confidence_allocation_method=np.array(
-            CONFIDENCE_ALLOCATION_METHOD),
-        bound_kind=np.array(BOUND_KIND),
-        confidence_scope=np.array('saved_beta_grid_only'),
-        density_accuracy_scope=np.array('adaptive_empirical_tail_criterion'),
-        grid_certificate_scope=np.array('finite_grid_only'),
-        version_label=np.array(args.version), run_signature=np.array(run_signature),
-        source_sha256=np.array(provenance['source_sha256']),
-        mhg_core_sha256=np.array(provenance['mhg_core_sha256']),
-        mhg_library_sha256=np.array(provenance['mhg_library_sha256']),
-        mhg_build_source_sha256=np.array(
-            provenance['mhg_build_source_sha256']),
-        settings_json=np.array(json.dumps(run_settings, sort_keys=True)),
-        betas=betas_alfd, bounds=bounds_confidence,
-        bounds_se=np.zeros_like(bounds_confidence),
-        bounds_point=bounds_point, bounds_point_se=bounds_point_se,
-        bounds_grid_lower=lower_grid_point,
-        bounds_grid_lower_confidence=lower_grid_confidence,
-        epsilon_grid=epsilon_grid_point,
-        epsilon_grid_confidence=epsilon_grid_confidence,
-        invariant_benchmark_power=benchmark_power,
-        invariant_benchmark_se=benchmark_se,
-        invariant_benchmark_lower_confidence=benchmark_lower_confidence,
-        fit_complementarity_residual=fit_residual,
-        fit_converged=fit_converged,
-        fit_iterations=fit_iterations,
-        max_validation_rejection_probability=max_validation_rp,
-        max_m_used=max_m_used,
+        **checkpoint_metadata,
+        density_accuracy_scope=np.array("adaptive_empirical_tail_criterion"),
+        betas=betas, ncp=ncp_table,
+        **checkpoint_arrays,
         common_null_grid=np.asarray(common_grid, dtype=float),
-        common_grid_size=np.array(H_common),
-        active_support_count=active_support_count,
-        discarded_weight_mass=discarded_weight_mass,
-        fitted_weights_full=fitted_weights_full,
-        retained_weights=retained_weights,
-        retained_indices=retained_indices,
-        gkm_point_upper=gkm_point_upper,
-        gkm_grid_lower=gkm_grid_lower, gkm_epsilon=gkm_epsilon,
-        training_bank_id=np.array(training_bank.bank_id),
-        audit_bank_id=np.array(audit_bank.bank_id),
-        training_bank_content_signature=np.array(
-            training_bank.content_signature),
-        audit_bank_content_signature=np.array(audit_bank.content_signature),
-        pooled_experiment_signature=np.array(
-            training_bank.experiment_signature),
-        training_bank_mhg_diagnostics_json=np.array(json.dumps(
-            _json_safe(training_bank.mhg_diagnostics), sort_keys=True)),
-        audit_bank_mhg_diagnostics_json=np.array(json.dumps(
-            _json_safe(audit_bank.mhg_diagnostics), sort_keys=True)),
-        diagnostics_json=diagnostics_json,
-        ncp=ncp_table, kappas=kappas, k=np.array(k), n=np.array(n),
-        alpha=np.array(alpha), curve_confidence=np.array(args.curve_confidence),
-        grid_lower_curve_confidence=np.array(args.curve_confidence),
-        grid_bracket_curve_confidence=np.array(
-            max(0.0, 2.0 * args.curve_confidence - 1.0)),
-        point_confidence_delta=np.array(point_delta), M_start=np.array(M_start),
-        M_step=np.array(args.m_step), M_max=np.array(args.m_max),
-        mhg_rtol=np.array(args.mhg_rtol), seed=np.array(args.seed),
-        n_fit=np.array(budget['n_fit']),
-        n_calibration=np.array(budget['n_calibration']),
-        n_validation=np.array(budget['n_validation']),
-        n_power=np.array(budget['n_power']), n_iter=np.array(budget['n_iter']),
+        common_grid_size=np.array(H),
         grid_shapes=np.array(args.grid_shapes),
         grid_strengths=np.array(args.grid_strengths),
         grid_max_strength=np.array(args.grid_max_strength),
         grid_anchor_count=np.array(grid_anchor_count),
-        max_active_support=np.array(active_cap))
+        grid_design_beta_count=np.array(GRID_DESIGN_BETA_COUNT),
+        bank_id=np.array(bank.bank_id),
+        bank_content_signature=np.array(bank.content_signature),
+        bank_mhg_diagnostics_json=np.array(json.dumps(
+            _json_safe(bank.mhg_diagnostics), sort_keys=True)),
+        M_start=np.array(M_start), M_step=np.array(args.m_step),
+        M_max=np.array(args.m_max), mhg_rtol=np.array(args.mhg_rtol),
+        seed=np.array(args.seed), n_fit=np.array(budget["n_fit"]),
+        n_power=np.array(budget["n_power"]),
+        n_iter=np.array(budget["n_iter"]))
     _atomic_savez(out_npz, **save_payload)
     if os.path.isfile(partial_npz):
         os.unlink(partial_npz)
-
-    plt.figure(figsize=(8, 5))
-    plt.plot(betas_alfd, bounds_confidence, 'go-', linewidth=2, markersize=5,
-             label=(rf'EMW upper ({args.curve_confidence:.0%} simultaneous MC; '
-                    'conditional on density accuracy)'))
-    plt.plot(betas_alfd, bounds_point, 'g--', linewidth=1.2,
-             label='EMW paper-style point estimate')
-    plt.plot(betas_alfd, lower_grid_point, color='darkorange', linestyle=':',
-             linewidth=1.5, label='GKM finite-grid lower endpoint')
-    plt.axhline(alpha, color='gray', linestyle=':', label=rf'$\alpha={alpha}$')
-    plt.xlabel(r'True $\beta$')
-    plt.ylabel('Upper bound on power')
-    plt.title(rf'Calibrated EMW bound, $\kappa$ = {kappas.tolist()}, '
-              rf'adaptive $M\leq {args.m_max}$')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=120)
-    print(f"\nSaved {out_npz} and {out_png}")
+    print(f"\nSaved {out_npz}", flush=True)
 
 
 if __name__ == "__main__":

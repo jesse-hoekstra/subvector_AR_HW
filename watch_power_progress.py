@@ -1,4 +1,4 @@
-"""Read-only live monitor for a long adaptive EMW power-bound run.
+"""Read-only live monitor for a long direct GKM/EMW power-bound run.
 
 This process deliberately stays separate from :mod:`alfd_eigval`: plotting or
 network failures must never interrupt, slow, or change the numerical run.  It
@@ -6,8 +6,7 @@ polls the atomically published partial checkpoint and switches to the final
 artifact once that artifact is compatible with the same run.
 
 The plot deliberately stays presentation-focused: it shows the three cached
-DGP curves and the primary confidence-valid EMW upper bound.  Additional
-diagnostics remain available in the exported values and metrics.
+DGP curves, the direct GKM Appendix-D.3.2 extension, and the size reference.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ import os
 import re
 import tempfile
 import time
-import warnings
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -35,6 +33,13 @@ import new_power_comparison as comparison
 
 
 _HEX_SIGNATURE = re.compile(r"^[0-9a-f]{64}$")
+GKM_SCHEMA_VERSION = 4
+GKM_ALGORITHM = "gkm_eigval_mw3_adaptive_v4"
+GKM_PRODUCER = "alfd_eigval.py"
+GKM_CALIBRATION_METHOD = "gkm_step6_reused_pooled_bank"
+GKM_BOUND_KIND = "gkm_d3_2_grid_adjusted_mc_power_bound"
+GKM_COMMON_GRID_METHOD = "strength_shape_3d_v1"
+GKM_POOLED_IS_METHOD = "gkm_stratified_equal_null_mixture_v1"
 
 
 @dataclass(frozen=True)
@@ -52,12 +57,11 @@ class DgpCurves:
 
 @dataclass(frozen=True)
 class BoundProgress:
-    """One internally consistent snapshot of the EMW checkpoint/artifact."""
+    """One internally consistent snapshot of the direct-GKM artifact."""
 
     betas: np.ndarray
-    bounds_confidence: np.ndarray
-    bounds_point: np.ndarray
-    benchmark_lower_confidence: np.ndarray
+    bounds: np.ndarray
+    bounds_se: np.ndarray
     run_signature: str
     source_path: str
     is_final: bool
@@ -121,11 +125,12 @@ def _probability(value: Any, name: str) -> float:
 def load_dgp_curves(version: str, path: Optional[str] = None) -> DgpCurves:
     """Strictly load the canonical finite-sample DGP cache.
 
-    The cache's signed settings provide the simulation count, seed, chunking,
+    The cache's provenance-checked settings provide the simulation count,
+    seed, chunking,
     grid, and experiment configuration.  Those values are then passed through
     ``new_power_comparison.load_compatible_dgp_cache``.  Consequently the
-    existing full provenance contract (including current source hashes and
-    software environment) remains the single source of truth.
+    existing full provenance contract (including checked producer
+    provenance and software environment) remains the single source of truth.
     """
 
     if version not in comparison.VERSION_LABELS:
@@ -175,11 +180,11 @@ def load_dgp_curves(version: str, path: Optional[str] = None) -> DgpCurves:
 
 
 def _validate_bound_arrays(
-        betas: Any, confidence: Any, point: Any, benchmark: Any,
-        *, alpha: Optional[float]) -> tuple[np.ndarray, ...]:
+        betas: Any, bounds: Any, bounds_se: Any,
+        *, require_complete: bool) -> tuple[np.ndarray, ...]:
     arrays = tuple(np.asarray(value, dtype=float).copy() for value in (
-        betas, confidence, point, benchmark))
-    betas, confidence, point, benchmark = arrays
+        betas, bounds, bounds_se))
+    betas, bounds, bounds_se = arrays
     if betas.ndim != 1 or betas.size == 0:
         raise ValueError("bound betas must be a nonempty one-dimensional array")
     if any(value.shape != betas.shape for value in arrays[1:]):
@@ -187,60 +192,54 @@ def _validate_bound_arrays(
     if not np.all(np.isfinite(betas)) or np.any(np.diff(betas) <= 0.0):
         raise ValueError("bound beta grid must be finite and strictly increasing")
 
-    complete = np.isfinite(confidence)
-    for name, value in (
-            ("bounds_point", point),
-            ("benchmark_lower_confidence", benchmark)):
-        if not np.array_equal(np.isfinite(value), complete):
-            raise ValueError(
-                f"{name} and bounds_confidence have different completion masks")
-    for name, value in (
-            ("bounds_confidence", confidence), ("bounds_point", point),
-            ("benchmark_lower_confidence", benchmark)):
-        finite = value[complete]
-        if np.any((finite < 0.0) | (finite > 1.0)):
-            raise ValueError(f"completed {name} values must lie in [0, 1]")
-    if alpha is not None and np.any(confidence[complete] < alpha - 1e-12):
-        raise ValueError("a completed EMW upper bound lies below alpha")
-    if np.any(confidence[complete] + 1e-12 < benchmark[complete]):
-        raise ValueError(
-            "EMW confidence upper lies below its same-experiment benchmark lower")
+    complete = np.isfinite(bounds)
+    if not np.array_equal(np.isfinite(bounds_se), complete):
+        raise ValueError("bounds and bounds_se have different completion masks")
+    if require_complete and not np.all(complete):
+        raise ValueError("final GKM artifact contains incomplete beta points")
+    if np.any((bounds[complete] < 0.0) | (bounds[complete] > 1.0)):
+        raise ValueError("completed bounds must lie in [0, 1]")
+    if np.any(bounds_se[complete] < 0.0):
+        raise ValueError("completed bounds_se values must be nonnegative")
     return arrays
 
 
-def _validate_partial_metadata(
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _validate_bound_metadata(
         archive: np.lib.npyio.NpzFile, version: str,
-        expected_run_signature: Optional[str]) -> tuple[str, Optional[dict[str, Any]]]:
-    signature = _validate_signature(_scalar(archive, "run_signature"))
+        expected_run_signature: Optional[str]) -> tuple[str, dict[str, Any]]:
+    settings, calculated = _canonical_settings_and_signature(
+        _scalar(archive, "settings_json"))
+    signature = _validate_signature(
+        _scalar(archive, "run_signature"), calculated)
     if expected_run_signature is not None and signature != expected_run_signature:
         raise ValueError(
             f"run signature differs: {signature!r} != {expected_run_signature!r}")
 
-    # Older checkpoints contain only the signature and numerical arrays.  Such
-    # a snapshot can be shape/range checked but not provenance-authenticated.
-    # New checkpoints publish this complete metadata group before bank fitting.
-    metadata = {
-        "schema_version", "algorithm", "producer", "bound_kind",
-        "version_label", "settings_json", "kappas", "k", "n", "alpha",
-        "curve_confidence",
+    required_top_level = {
+        "schema_version", "algorithm", "producer", "calibration_method",
+        "bound_kind", "version_label", "settings_json", "run_signature",
+        "kappas", "k", "n", "alpha",
     }
-    present = metadata.intersection(archive.files)
-    if not present:
-        return signature, None
-    missing = metadata.difference(archive.files)
+    missing = required_top_level.difference(archive.files)
     if missing:
         raise ValueError(
-            "partial checkpoint has incomplete provenance metadata: "
+            "GKM artifact has incomplete provenance metadata: "
             + ", ".join(sorted(missing)))
 
-    settings, calculated = _canonical_settings_and_signature(
-        _scalar(archive, "settings_json"))
-    _validate_signature(signature, calculated)
     scalar_expected = {
-        "schema_version": comparison.ALFD_SCHEMA_VERSION,
-        "algorithm": comparison.ALFD_ALGORITHM,
-        "producer": comparison.ALFD_PRODUCER,
-        "bound_kind": comparison.ALFD_BOUND_KIND,
+        "schema_version": GKM_SCHEMA_VERSION,
+        "algorithm": GKM_ALGORITHM,
+        "producer": GKM_PRODUCER,
+        "calibration_method": GKM_CALIBRATION_METHOD,
+        "bound_kind": GKM_BOUND_KIND,
         "version_label": version,
     }
     mismatches = []
@@ -248,24 +247,27 @@ def _validate_partial_metadata(
         saved = _scalar(archive, key)
         if saved != expected:
             mismatches.append(f"{key}={saved!r}, expected {expected!r}")
-        # `bound_kind` is an authenticated top-level result label rather than
-        # a numerical run setting; the other fields are signed in both places.
         if key != "bound_kind" and settings.get(key) != saved:
-            mismatches.append(f"settings_json {key} disagrees with checkpoint")
+            mismatches.append(f"settings_json {key} disagrees with artifact")
 
     for key in ("k", "n"):
         saved = _scalar(archive, key)
         if settings.get(key) != saved:
-            mismatches.append(f"settings_json {key} disagrees with checkpoint")
-    for key in ("alpha", "curve_confidence"):
-        saved = _scalar(archive, key)
-        try:
-            matches = bool(np.isclose(
-                settings.get(key), saved, rtol=0.0, atol=1e-12))
-        except TypeError:
-            matches = False
-        if not matches:
-            mismatches.append(f"settings_json {key} disagrees with checkpoint")
+            mismatches.append(f"settings_json {key} disagrees with artifact")
+    saved_alpha = _scalar(archive, "alpha")
+    try:
+        alpha_matches = bool(np.isclose(
+            settings.get("alpha"), saved_alpha, rtol=0.0, atol=1e-12))
+    except TypeError:
+        alpha_matches = False
+    if not alpha_matches:
+        mismatches.append("settings_json alpha disagrees with artifact")
+    try:
+        _plain_int(_scalar(archive, "k"), positive=True)
+        _plain_int(_scalar(archive, "n"), positive=True)
+        _probability(saved_alpha, "bound alpha")
+    except ValueError as exc:
+        mismatches.append(str(exc))
 
     saved_kappas = np.asarray(archive["kappas"], dtype=float)
     try:
@@ -276,30 +278,66 @@ def _validate_partial_metadata(
         if (saved_kappas.shape != settings_kappas.shape
                 or not np.allclose(saved_kappas, settings_kappas,
                                    rtol=0.0, atol=1e-12)):
-            mismatches.append("settings_json kappas disagree with checkpoint")
+            mismatches.append("settings_json kappas disagree with artifact")
+    if (saved_kappas.shape != (3,) or not np.all(np.isfinite(saved_kappas))
+            or np.any(saved_kappas < 0.0)
+            or np.any(np.diff(saved_kappas) > 1e-12)):
+        mismatches.append("kappas must be three ordered nonnegative values")
 
     expected_methods = {
-        "calibration_method": comparison.ALFD_CALIBRATION_METHOD,
-        "confidence_allocation_method": (
-            comparison.ALFD_CONFIDENCE_ALLOCATION_METHOD),
-        "fit_grid_strategy": comparison.ALFD_COMMON_GRID_METHOD,
-        "pooled_importance_method": comparison.ALFD_POOLED_IS_METHOD,
+        "calibration_method": GKM_CALIBRATION_METHOD,
+        "fit_grid_strategy": GKM_COMMON_GRID_METHOD,
+        "pooled_importance_method": GKM_POOLED_IS_METHOD,
     }
     for key, expected in expected_methods.items():
         if settings.get(key) != expected:
             mismatches.append(
                 f"settings_json {key}={settings.get(key)!r}, expected {expected!r}")
     if settings.get("profile") not in ("production", "reference"):
-        mismatches.append("partial checkpoint is not a production/reference run")
+        mismatches.append("artifact is not a production/reference run")
+    for key in ("n_fit", "n_power"):
+        value = settings.get(key)
+        if (not isinstance(value, (int, np.integer))
+                or isinstance(value, (bool, np.bool_)) or int(value) < 2):
+            mismatches.append(
+                f"settings_json {key}={value!r} is not an integer >= 2")
+    n_iter = settings.get("n_iter")
+    if (not isinstance(n_iter, (int, np.integer))
+            or isinstance(n_iter, (bool, np.bool_)) or int(n_iter) < 1):
+        mismatches.append("settings_json n_iter is not a positive integer")
+    beta_count = settings.get("beta_count")
+    if (not isinstance(beta_count, (int, np.integer))
+            or isinstance(beta_count, (bool, np.bool_))
+            or int(beta_count) < 3 or int(beta_count) % 2 != 1):
+        mismatches.append(
+            "settings_json beta_count is not an odd integer >= 3")
+    bank_seed = settings.get("bank_seed")
+    if (not isinstance(bank_seed, (int, np.integer))
+            or isinstance(bank_seed, (bool, np.bool_))
+            or int(bank_seed) < 0):
+        mismatches.append(
+            "settings_json bank_seed is not a nonnegative integer")
+
+    try:
+        common_grid = np.asarray(settings["common_grid"], dtype=float)
+    except (KeyError, TypeError, ValueError):
+        mismatches.append("settings_json has invalid common_grid")
+    else:
+        if (common_grid.ndim != 2 or common_grid.shape[0] == 0
+                or common_grid.shape[1] != 3
+                or not np.all(np.isfinite(common_grid))
+                or np.any(common_grid < 0.0)
+                or np.any(np.diff(common_grid, axis=1) > 1e-10)):
+            mismatches.append("settings_json common_grid is not an ordered H by 3 grid")
 
     repository = os.path.dirname(os.path.abspath(__file__))
     library_name = "libmhg.dylib" if os.sys.platform == "darwin" else "libmhg.so"
     current_hashes = {
-        "source_sha256": comparison._sha256_file(
+        "source_sha256": _sha256_file(
             os.path.join(repository, "alfd_eigval.py")),
-        "mhg_core_sha256": comparison._sha256_file(
+        "mhg_core_sha256": _sha256_file(
             os.path.join(repository, "koev", "mhg15", "mhg_core.c")),
-        "mhg_library_sha256": comparison._sha256_file(
+        "mhg_library_sha256": _sha256_file(
             os.path.join(repository, "koev", "mhg15", library_name)),
     }
     current_hashes["mhg_build_source_sha256"] = current_hashes[
@@ -308,75 +346,47 @@ def _validate_partial_metadata(
         if settings.get(key) != expected:
             mismatches.append(f"settings_json {key} is not current")
     if mismatches:
-        raise ValueError("incompatible partial checkpoint: " + "; ".join(mismatches))
+        raise ValueError("incompatible GKM artifact: " + "; ".join(mismatches))
     return signature, settings
+
+
+def _load_snapshot(
+        version: str, path: str,
+        expected_run_signature: Optional[str], *, is_final: bool) -> BoundProgress:
+    with np.load(path, allow_pickle=False) as archive:
+        signature, settings = _validate_bound_metadata(
+            archive, version, expected_run_signature)
+        required = ("betas", "bounds", "bounds_se")
+        missing = [key for key in required if key not in archive.files]
+        if missing:
+            raise ValueError(
+                "GKM artifact is missing arrays: " + ", ".join(missing))
+        arrays = _validate_bound_arrays(
+            archive["betas"], archive["bounds"], archive["bounds_se"],
+            require_complete=is_final)
+        beta_count = settings.get("beta_count")
+        if (not isinstance(beta_count, (int, np.integer))
+                or isinstance(beta_count, (bool, np.bool_))
+                or int(beta_count) != arrays[0].size):
+            raise ValueError(
+                "settings_json beta_count disagrees with artifact beta grid")
+    return BoundProgress(
+        *arrays, run_signature=signature, source_path=path,
+        is_final=is_final, settings=dict(settings))
 
 
 def _load_partial(
         version: str, path: str,
         expected_run_signature: Optional[str]) -> BoundProgress:
-    with np.load(path, allow_pickle=False) as archive:
-        signature, settings = _validate_partial_metadata(
-            archive, version, expected_run_signature)
-        required = (
-            "betas", "bounds_confidence", "bounds_point",
-            "benchmark_lower_confidence",
-        )
-        missing = [key for key in required if key not in archive.files]
-        if missing:
-            raise ValueError(
-                "partial checkpoint is missing arrays: " + ", ".join(missing))
-        alpha = None if settings is None else _probability(
-            settings.get("alpha"), "bound alpha")
-        arrays = _validate_bound_arrays(
-            archive["betas"], archive["bounds_confidence"],
-            archive["bounds_point"], archive["benchmark_lower_confidence"],
-            alpha=alpha)
-        if settings is not None:
-            beta_count = settings.get("beta_count")
-            if (not isinstance(beta_count, (int, np.integer))
-                    or isinstance(beta_count, (bool, np.bool_))
-                    or int(beta_count) != arrays[0].size):
-                raise ValueError(
-                    "settings_json beta_count disagrees with checkpoint beta grid")
-    return BoundProgress(
-        *arrays, run_signature=signature, source_path=path,
-        is_final=False, settings=None if settings is None else dict(settings))
+    return _load_snapshot(
+        version, path, expected_run_signature, is_final=False)
 
 
 def _load_final(
         version: str, path: str,
         expected_run_signature: Optional[str]) -> BoundProgress:
-    with np.load(path, allow_pickle=False) as archive:
-        settings, calculated = _canonical_settings_and_signature(
-            _scalar(archive, "settings_json"))
-        signature = _validate_signature(
-            _scalar(archive, "run_signature"), calculated)
-    if expected_run_signature is not None and signature != expected_run_signature:
-        raise ValueError(
-            f"run signature differs: {signature!r} != {expected_run_signature!r}")
-
-    required = ("kappas", "k", "n", "alpha")
-    missing = [key for key in required if key not in settings]
-    if missing:
-        raise ValueError("final settings_json is missing: " + ", ".join(missing))
-    kappas = np.asarray(settings["kappas"], dtype=float)
-    k = _plain_int(settings["k"], positive=True)
-    n = _plain_int(settings["n"], positive=True)
-    alpha = _probability(settings["alpha"], "bound alpha")
-
-    # This validates all v3 strategy/provenance fields and current code hashes.
-    strict_betas, strict_bounds, _ = comparison.load_compatible_alfd_bound(
-        path, version_label=version, kappas=kappas, k=k, n=n, alpha=alpha)
-    with np.load(path, allow_pickle=False) as archive:
-        point = np.asarray(archive["bounds_point"], dtype=float)
-        benchmark = np.asarray(
-            archive["invariant_benchmark_lower_confidence"], dtype=float)
-    arrays = _validate_bound_arrays(
-        strict_betas, strict_bounds, point, benchmark, alpha=alpha)
-    return BoundProgress(
-        *arrays, run_signature=signature, source_path=path,
-        is_final=True, settings=dict(settings))
+    return _load_snapshot(
+        version, path, expected_run_signature, is_final=True)
 
 
 def load_bound_progress(
@@ -393,12 +403,12 @@ def load_bound_progress(
 
     if version not in comparison.VERSION_LABELS:
         raise ValueError(f"unknown version label {version!r}")
-    adaptive = os.path.join(version, "adaptive")
+    direct = os.path.join(version, "gkm_direct")
     if partial_path is None:
         partial_path = os.path.join(
-            adaptive, f"alfd_eigval_{version}.partial.npz")
+            direct, f"gkm_eigval_{version}.partial.npz")
     if final_path is None:
-        final_path = os.path.join(adaptive, f"alfd_eigval_{version}.npz")
+        final_path = os.path.join(direct, f"gkm_eigval_{version}.npz")
     partial_path, final_path = os.fspath(partial_path), os.fspath(final_path)
 
     partial = None
@@ -458,12 +468,6 @@ def load_bound_progress(
 
 
 def _validate_same_experiment(dgp: DgpCurves, progress: BoundProgress) -> None:
-    if progress.settings is None:
-        warnings.warn(
-            "partial checkpoint predates authenticated progress metadata; "
-            "the overlay cannot cross-check its experiment against the DGP cache",
-            RuntimeWarning)
-        return
     mismatches = []
     for key in ("version_label", "k", "n"):
         if progress.settings.get(key) != dgp.settings.get(key):
@@ -502,29 +506,26 @@ def _progress_metrics(
         "completed_beta_count": 0,
         "total_beta_count": 0 if progress is None else int(progress.betas.size),
         "is_final": bool(progress is not None and progress.is_final),
-        "cross_experiment_crossing_count": 0,
-        "cross_experiment_min_gap": float("nan"),
-        "same_experiment_min_certified_slack": float("nan"),
+        "below_c3_count": 0,
+        "minimum_c3_gap": float("nan"),
     }
     if progress is None:
         return metrics
-    complete = np.isfinite(progress.bounds_confidence)
+    complete = np.isfinite(progress.bounds)
     metrics["completed_beta_count"] = int(np.count_nonzero(complete))
     if not np.any(complete):
         return metrics
     beta = progress.betas[complete]
-    confidence = progress.bounds_confidence[complete]
+    bounds = progress.bounds[complete]
     cp1 = np.interp(beta, dgp.betas, dgp.power_cp1)
-    gap = confidence - cp1
-    slack = confidence - progress.benchmark_lower_confidence[complete]
+    gap = bounds - cp1
     metrics.update({
         "latest_beta": float(beta[-1]),
-        "latest_confidence_upper": float(confidence[-1]),
-        "latest_power_cp1": float(cp1[-1]),
-        "latest_cross_experiment_gap": float(gap[-1]),
-        "cross_experiment_crossing_count": int(np.count_nonzero(gap < -1e-12)),
-        "cross_experiment_min_gap": float(np.min(gap)),
-        "same_experiment_min_certified_slack": float(np.min(slack)),
+        "latest_gkm_power_bound": float(bounds[-1]),
+        "latest_c3": float(cp1[-1]),
+        "latest_c3_gap": float(gap[-1]),
+        "below_c3_count": int(np.count_nonzero(gap < -1e-12)),
+        "minimum_c3_gap": float(np.min(gap)),
     })
     return metrics
 
@@ -544,17 +545,12 @@ def build_progress_figure(
               label=r"$c_3$")
 
     if progress is not None:
-        complete = np.isfinite(progress.bounds_confidence)
+        complete = np.isfinite(progress.bounds)
         beta = progress.betas[complete]
-        confidence = progress.bounds_confidence[complete]
-        confidence_level = None
-        if progress.settings is not None:
-            confidence_level = progress.settings.get("curve_confidence")
-        label = "EMW upper bound"
-        if confidence_level is not None:
-            label += f" ({float(confidence_level):.0%} simultaneous confidence)"
-        axis.plot(beta, confidence, color="green", marker="o",
-                  linewidth=2.4, markersize=6, label=label)
+        bounds = progress.bounds[complete]
+        axis.plot(
+            beta, bounds, color="green", marker="o", linewidth=2.4,
+            markersize=6, label=r"GKM power bound ($m_W=3$)")
 
     alpha = float(dgp.settings["alpha"])
     axis.axhline(alpha, color="gray", linestyle=":", linewidth=1.0,
@@ -568,17 +564,17 @@ def build_progress_figure(
     demo_prefix = ("SYNTHETIC W&B DEMO — NOT A SCIENTIFIC RESULT — "
                    if dgp.settings.get("demo") else "")
     axis.set_title(
-        f"{demo_prefix}EMW power-bound progress — "
+        f"{demo_prefix}GKM power-bound progress — "
         f"{dgp.settings['version_label']} ({state})")
     plotted_max = max(
         float(np.max(dgp.power_chi2)), float(np.max(dgp.power_c1)),
         float(np.max(dgp.power_cp1)))
     if progress is not None:
-        complete = np.isfinite(progress.bounds_confidence)
+        complete = np.isfinite(progress.bounds)
         if np.any(complete):
             plotted_max = max(
                 plotted_max,
-                float(np.max(progress.bounds_confidence[complete])))
+                float(np.max(progress.bounds[complete])))
     axis.set_ylim(0.0, min(1.02, max(0.15, plotted_max + 0.05)))
     x_min = float(dgp.betas[0])
     x_max = float(dgp.betas[-1])
@@ -659,48 +655,21 @@ def write_progress_values(
                     synthetic_demo=str(bool(dgp.settings.get("demo"))).lower()))
 
         if progress is not None:
-            complete = np.isfinite(progress.bounds_confidence)
-            limit_scope = ("synthetic_demo" if (
-                progress.settings is not None
-                and progress.settings.get("demo")) else "limit_experiment")
-            series_values = (
-                ("bounds_confidence", progress.bounds_confidence),
-                ("bounds_point", progress.bounds_point),
-                ("benchmark_lower_confidence",
-                 progress.benchmark_lower_confidence),
-            )
-            for series, values in series_values:
-                for index, (beta, value) in enumerate(
-                        zip(progress.betas, values)):
-                    writer.writerow(dict(
-                        scope=limit_scope, series=series,
-                        beta=f"{beta:.17g}",
-                        value=(f"{value:.17g}" if np.isfinite(value) else ""),
-                        completed=str(bool(complete[index])).lower(),
-                        is_final=str(bool(progress.is_final)).lower(),
-                        bound_run_signature=progress.run_signature,
-                        dgp_run_signature=dgp.run_signature,
-                        synthetic_demo=str(bool(
-                            progress.settings is not None
-                            and progress.settings.get("demo"))).lower()))
-
-            cp1_at_beta = np.interp(
-                progress.betas, dgp.betas, dgp.power_cp1)
-            gaps = progress.bounds_confidence - cp1_at_beta
-            for series, values in (
-                    ("power_cp1_interpolated_at_bound_beta", cp1_at_beta),
-                    ("bounds_confidence_minus_power_cp1", gaps)):
-                for index, (beta, value) in enumerate(
-                        zip(progress.betas, values)):
-                    writer.writerow(dict(
-                        scope="cross_experiment_diagnostic", series=series,
-                        beta=f"{beta:.17g}",
-                        value=(f"{value:.17g}" if np.isfinite(value) else ""),
-                        completed=str(bool(complete[index])).lower(),
-                        is_final=str(bool(progress.is_final)).lower(),
-                        bound_run_signature=progress.run_signature,
-                        dgp_run_signature=dgp.run_signature,
-                        synthetic_demo=str(bool(dgp.settings.get("demo"))).lower()))
+            complete = np.isfinite(progress.bounds)
+            limit_scope = ("synthetic_demo" if progress.settings.get("demo")
+                           else "limit_experiment")
+            for index, (beta, value) in enumerate(
+                    zip(progress.betas, progress.bounds)):
+                writer.writerow(dict(
+                    scope=limit_scope, series="gkm_power_bound",
+                    beta=f"{beta:.17g}",
+                    value=(f"{value:.17g}" if np.isfinite(value) else ""),
+                    completed=str(bool(complete[index])).lower(),
+                    is_final=str(bool(progress.is_final)).lower(),
+                    bound_run_signature=progress.run_signature,
+                    dgp_run_signature=dgp.run_signature,
+                    synthetic_demo=str(bool(
+                        progress.settings.get("demo"))).lower()))
         handle.flush()
         os.fsync(handle.fileno())
         handle.close()
@@ -747,9 +716,9 @@ class WandbLogger:
                 "install it with `python3 -m pip install wandb`") from exc
         is_demo = bool(dgp.settings.get("demo"))
         run_id = self.run_id or (
-            f"emw-demo-{progress.run_signature[:16]}" if is_demo
-            else f"emw-{progress.run_signature[:16]}")
-        default_prefix = ("[SYNTHETIC DEMO]" if is_demo else "EMW")
+            f"gkm-demo-{progress.run_signature[:16]}" if is_demo
+            else f"gkm-{progress.run_signature[:16]}")
+        default_prefix = ("[SYNTHETIC DEMO]" if is_demo else "GKM")
         name = self.name or (
             f"{default_prefix} {dgp.settings['version_label']} "
             f"{progress.run_signature[:8]}")
@@ -764,8 +733,6 @@ class WandbLogger:
                     "dgp_cache": dgp.path,
                     "synthetic_demo": bool(dgp.settings.get("demo")),
                     "cross_experiment_overlay": True,
-                    "cross_experiment_note": (
-                        "DGP/EMW crossing is diagnostic, not a formal violation"),
                 })
         except Exception as exc:
             raise RuntimeError(f"could not initialize W&B: {exc}") from exc
@@ -784,7 +751,7 @@ class WandbLogger:
             self.upload_failures += 1
             print(
                 "WARNING: W&B upload failed; the local PNG is current and "
-                f"the next checkpoint will retry (failure "
+                f"the next watcher poll will retry (failure "
                 f"{self.upload_failures}): {exc}")
             return False
 
@@ -830,22 +797,17 @@ def _synthetic_demo_progress(
     betas = np.linspace(-2.0, 2.0, 5)
     completed = min(max(int(completed), 0), betas.size)
     cp1 = np.interp(betas, dgp.betas, dgp.power_cp1)
-    upper_target = np.minimum(cp1 + 0.05, 0.995)
-    point_target = np.minimum(cp1 + 0.025, upper_target)
-    benchmark_target = np.maximum(0.05, cp1 - 0.01)
+    bound_target = np.minimum(cp1 + 0.035, 0.995)
     exact_null = np.isclose(betas, 0.0, rtol=0.0, atol=1e-15)
-    upper_target[exact_null] = 0.05
-    point_target[exact_null] = 0.05
-    benchmark_target[exact_null] = 0.05
-    arrays = [np.full(betas.size, np.nan) for _ in range(3)]
-    for destination, source in zip(
-            arrays, (upper_target, point_target, benchmark_target)):
-        destination[:completed] = source[:completed]
+    bound_target[exact_null] = 0.05
+    bounds = np.full(betas.size, np.nan)
+    bounds_se = np.full(betas.size, np.nan)
+    bounds[:completed] = bound_target[:completed]
+    bounds_se[:completed] = 0.002
     settings = dict(dgp.settings)
-    settings.update(curve_confidence=0.95, beta_count=int(betas.size))
+    settings.update(beta_count=int(betas.size))
     return BoundProgress(
-        betas=betas, bounds_confidence=arrays[0], bounds_point=arrays[1],
-        benchmark_lower_confidence=arrays[2],
+        betas=betas, bounds=bounds, bounds_se=bounds_se,
         run_signature=run_signature, source_path="<synthetic-demo>",
         is_final=completed == betas.size, settings=settings)
 
@@ -855,7 +817,7 @@ def _run_synthetic_demo(
     dgp = _synthetic_demo_dgp(args.version)
     bound_signature = hashlib.sha256(
         ("synthetic-bound:" + dgp.run_signature).encode()).hexdigest()
-    demo_directory = os.path.join(args.version, "adaptive", "demo")
+    demo_directory = os.path.join(args.version, "gkm_direct", "demo")
     demo_tag = bound_signature[:12]
     output = args.output or os.path.join(
         demo_directory, f"live_power_progress_demo_{demo_tag}.png")
@@ -882,12 +844,11 @@ def _run_synthetic_demo(
 def _fingerprint(progress: Optional[BoundProgress]) -> Any:
     if progress is None:
         return None
-    complete = np.isfinite(progress.bounds_confidence)
+    complete = np.isfinite(progress.bounds)
     digest = hashlib.sha256()
     for value in (
-            progress.betas, complete, progress.bounds_confidence[complete],
-            progress.bounds_point[complete],
-            progress.benchmark_lower_confidence[complete]):
+            progress.betas, complete, progress.bounds[complete],
+            progress.bounds_se[complete]):
         digest.update(np.ascontiguousarray(value).view(np.uint8))
     return progress.run_signature, progress.is_final, digest.hexdigest()
 
@@ -895,7 +856,7 @@ def _fingerprint(progress: Optional[BoundProgress]) -> Any:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Watch an adaptive EMW checkpoint, render a live feasible-curve "
+            "Watch a direct GKM checkpoint, render a live power-curve "
             "overlay, and optionally publish it to Weights & Biases."))
     parser.add_argument(
         "--version", required=True, choices=list(comparison.VERSION_LABELS))
@@ -910,7 +871,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true",
                         help="render the current snapshot once and exit")
     parser.add_argument("--expected-run-signature", default=None,
-                        help="optional 64-character ALFD run signature pin")
+                        help="optional 64-character GKM run signature pin")
     parser.add_argument("--demo", action="store_true",
                         help="log a short, clearly synthetic W&B demo")
     parser.add_argument("--demo-delay", type=float, default=0.5,
@@ -950,8 +911,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             "--demo cannot be combined with DGP/checkpoint paths, a run "
             "signature pin, or --once")
     if (args.demo and args.wandb_run_id is not None
-            and not args.wandb_run_id.startswith("emw-demo-")):
-        parser.error("a demo --wandb-run-id must start with 'emw-demo-'")
+            and not args.wandb_run_id.startswith("gkm-demo-")):
+        parser.error("a demo --wandb-run-id must start with 'gkm-demo-'")
 
     logger = WandbLogger(
         project=args.wandb_project, entity=args.wandb_entity,
@@ -961,9 +922,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         return
 
     dgp = load_dgp_curves(args.version, args.dgp_cache)
-    adaptive = os.path.join(args.version, "adaptive")
+    direct = os.path.join(args.version, "gkm_direct")
     output = args.output or os.path.join(
-        adaptive, f"live_power_progress_{args.version}.png")
+        direct, f"live_power_progress_{args.version}.png")
     csv_output = args.csv_output or os.path.splitext(output)[0] + ".csv"
 
     seen = object()
@@ -982,26 +943,34 @@ def main(argv: Optional[list[str]] = None) -> None:
             if fingerprint != seen:
                 metrics = write_progress_plot(dgp, progress, output)
                 write_progress_values(dgp, progress, csv_output)
-                seen = fingerprint
+                upload_complete = not logger.requested
                 if progress is None:
                     print(
                         f"Published {output} and {csv_output}; waiting for an "
-                        "ALFD checkpoint.")
+                        "GKM checkpoint.")
+                    upload_complete = True
                 else:
                     print(
                         f"Published {output} and {csv_output}: "
                         f"{metrics['completed_beta_count']}/"
                         f"{metrics['total_beta_count']} betas complete; "
-                        f"cross-experiment diagnostic crossings="
-                        f"{metrics['cross_experiment_crossing_count']}.")
-                    logger.start(dgp, progress)
-                    logger.log(output, metrics)
+                        f"points below c3={metrics['below_c3_count']}.")
+                    if logger.requested:
+                        logger.start(dgp, progress)
+                        upload_complete = logger.log(output, metrics)
+                # A transient W&B failure must not lose the terminal update.
+                # Leave the fingerprint unseen so the unchanged checkpoint is
+                # retried on the next poll; local PNG/CSV publication remains
+                # atomic and harmless to repeat.
+                if upload_complete:
+                    seen = fingerprint
 
-            if args.once or (progress is not None and progress.is_final):
+            if args.once or (progress is not None and progress.is_final
+                             and fingerprint == seen):
                 break
             time.sleep(args.poll_seconds)
     except KeyboardInterrupt:
-        print("Watcher stopped by user; the ALFD calculation was not touched.")
+        print("Watcher stopped by user; the GKM calculation was not touched.")
     finally:
         logger.finish()
 

@@ -2,89 +2,57 @@ import os
 import sys
 import tempfile
 import unittest
-import hashlib
+import io
 import json
 from unittest import mock
 
 import numpy as np
 from scipy.special import hyp0f1
-from scipy.stats import chi2, ncx2
 
 import alfd_eigval as alfd
 from new_power_comparison import (
     dgp_cache_path,
-    load_compatible_alfd_bound,
     load_compatible_dgp_cache,
     save_dgp_cache,
 )
 
 
 class CalibrationTests(unittest.TestCase):
-    def test_weighted_tail_randomizes_ties_to_exact_size(self):
+    def test_raw_weighted_tail_randomizes_ties_to_exact_size(self):
         scores = np.array([4.0, 3.0, 3.0, 2.0, 1.0])
         weights = np.array([0.1, 0.2, 0.3, 0.1, 0.3])
-        rule = alfd.calibrate_weighted_tail(scores, weights, alpha=0.35)
+        rule = alfd.calibrate_raw_weighted_tail(scores, weights, alpha=0.35)
         attained = np.dot(
             weights, alfd.tail_rejection_probabilities(scores, rule))
         self.assertAlmostEqual(attained, 0.35, places=14)
         self.assertEqual(rule.threshold, 3.0)
         self.assertAlmostEqual(rule.tie_probability, 0.5)
 
-    def test_confidence_rules_bracket_empirical_alpha_tail(self):
-        scores = np.linspace(0.0, 1.0, 20_000, endpoint=False)
-        liberal = alfd.confidence_liberal_tail_rule(
-            scores, alpha=0.05, delta=0.0025)
-        conservative = alfd.confidence_conservative_tail_rule(
-            scores, alpha=0.05, delta=0.0025)
-        self.assertGreater(liberal.empirical_size, 0.05)
-        self.assertLess(conservative.empirical_size, 0.05)
-        self.assertLess(liberal.threshold, conservative.threshold)
+    def test_raw_weighted_tail_rejects_nonfinite_inputs(self):
+        with self.assertRaises(ValueError):
+            alfd.calibrate_raw_weighted_tail(
+                [0.0, np.nan], [0.5, 0.5], alpha=0.05)
 
-    def test_confidence_rules_reject_nonfinite_scores(self):
-        for function in (alfd.confidence_liberal_tail_rule,
-                         alfd.confidence_conservative_tail_rule):
-            with self.assertRaises(ValueError):
-                function([0.0, np.nan], alpha=0.05, delta=0.01)
+    def test_reference_and_production_pair_totals_are_exact(self):
+        production = alfd._gkm_budget_diagnostics(
+            0.05, common_grid_size=68, n_nonnull=8,
+            budget=dict(n_fit=2_000, n_power=50_000, n_iter=600))
+        reference = alfd._gkm_budget_diagnostics(
+            0.05, common_grid_size=68, n_nonnull=8,
+            budget=dict(n_fit=10_000, n_power=100_000, n_iter=600))
 
-    def test_preflight_ranks_match_rules_and_phase_count(self):
-        alpha = 0.05
-        curve_confidence = 0.99
-        budget = dict(
-            n_fit=2000, n_calibration=20000, n_validation=2000,
-            n_power=50000, n_iter=600, validation_grid_size=32)
-        diagnostics = alfd._simulation_budget_diagnostics(
-            alpha, curve_confidence, [13] * 20, [32] * 20, budget)
-
-        self.assertEqual(diagnostics['calibration_rejection_count'], 1116)
-        self.assertAlmostEqual(
-            diagnostics['calibration_empirical_size'], 0.0558)
-        self.assertEqual(diagnostics['validation'][0]['rejection_count'], 58)
-        self.assertAlmostEqual(
-            diagnostics['validation'][0]['empirical_size'], 0.029)
-        self.assertEqual(diagnostics['total_pairs'], 44_800_000)
-
-        scores_cal = np.arange(budget['n_calibration'], dtype=float)
-        liberal = alfd.confidence_liberal_tail_rule(
-            scores_cal, alpha, diagnostics['event_delta'])
-        self.assertAlmostEqual(
-            liberal.empirical_size,
-            diagnostics['calibration_empirical_size'])
-
-        scores_validation = np.arange(budget['n_validation'], dtype=float)
-        conservative = alfd.confidence_conservative_tail_rule(
-            scores_validation, alpha,
-            diagnostics['validation'][0]['per_null_delta'])
-        self.assertAlmostEqual(
-            conservative.empirical_size,
-            diagnostics['validation'][0]['empirical_size'])
-
-    def test_preflight_rejects_infeasible_validation_budget(self):
-        budget = dict(
-            n_fit=100, n_calibration=2000, n_validation=100,
-            n_power=5000, n_iter=100, validation_grid_size=32)
-        with self.assertRaisesRegex(ValueError, 'cannot support'):
-            alfd._simulation_budget_diagnostics(
-                0.05, 0.99, [13] * 20, [32] * 20, budget)
+        self.assertEqual(production["phase_pairs"], {
+            "shared_null_bank": 9_248_000,
+            "beta_training_alternative": 1_088_000,
+            "beta_power": 27_600_000,
+        })
+        self.assertEqual(production["total_pairs"], 37_936_000)
+        self.assertEqual(reference["phase_pairs"], {
+            "shared_null_bank": 46_240_000,
+            "beta_training_alternative": 5_440_000,
+            "beta_power": 55_200_000,
+        })
+        self.assertEqual(reference["total_pairs"], 106_880_000)
 
 
 class PublicationWorkflowTests(unittest.TestCase):
@@ -100,7 +68,7 @@ class PublicationWorkflowTests(unittest.TestCase):
             eigs=np.zeros((4, 4)), log_f=np.log(density),
             log_q=np.log(proposal), base_weights=np.full(4, 0.25),
             strata=np.array([0, 0, 1, 1]), n_per_stratum=2,
-            role="training", bank_id="synthetic-bank")
+            role="gkm", bank_id="synthetic-bank")
 
     def test_common_null_grid_is_deterministic_nested_and_beta_invariant(self):
         alternatives = np.array([
@@ -169,7 +137,7 @@ class PublicationWorkflowTests(unittest.TestCase):
                                 for row in shape_rows))
         np.testing.assert_allclose(grid[-4:], standard_points)
 
-    def test_default_cli_beta_grid_has_eleven_symmetric_points_and_zero(self):
+    def test_default_cli_beta_grid_has_nine_symmetric_points_and_zero(self):
         observed = []
         grids = []
 
@@ -193,40 +161,53 @@ class PublicationWorkflowTests(unittest.TestCase):
                     alfd, 'asymptotic_ncp_eigenvalues', side_effect=fake_ncp), \
                 mock.patch.object(
                     alfd, 'common_null_grid_3d', side_effect=capture_grid), \
+                mock.patch.object(
+                    alfd, '_atomic_savez',
+                    side_effect=AssertionError('preflight wrote an artifact')), \
                 mock.patch('builtins.print'):
             alfd.main()
 
-        expected = np.linspace(-2.0, 2.0, 11)
-        np.testing.assert_allclose(observed, expected, rtol=0.0, atol=0.0)
-        self.assertEqual(observed[5], 0.0)
+        expected = np.linspace(-2.0, 2.0, 9)
+        design = np.linspace(-2.0, 2.0, 81)
         np.testing.assert_allclose(
-            np.asarray(observed), -np.asarray(observed)[::-1],
+            observed[:9], expected, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(
+            observed[9:], design, rtol=0.0, atol=0.0)
+        self.assertEqual(observed[4], 0.0)
+        np.testing.assert_allclose(
+            np.asarray(observed[:9]), -np.asarray(observed[:9])[::-1],
             rtol=0.0, atol=1e-15)
         self.assertEqual(len(grids), 1)
         self.assertEqual(len(grids[0][0]), 68)
         self.assertEqual(grids[0][1]['n_shapes'], 9)
         self.assertEqual(len(grids[0][1]['standard_points']), 4)
 
-    def test_common_bank_budget_counts_shared_null_tables_only_once(self):
-        budget = dict(
-            n_fit=2000, n_calibration=20000, n_validation=2000,
-            n_power=50000, n_iter=600, validation_grid_size=32)
-        diagnostics = alfd._common_is_budget_diagnostics(
-            0.05, 0.99, common_grid_size=68, n_nonnull=10,
-            max_active_support=8, budget=budget)
+    def test_beta_count_does_not_change_common_grid(self):
+        real_grid = alfd.common_null_grid_3d
+        constructed = []
 
-        self.assertEqual(diagnostics['phase_pairs'], {
-            'shared_fit_null': 9_248_000,
-            'fit_alternative': 1_360_000,
-            'calibration': 1_800_000,
-            'shared_audit_null': 9_248_000,
-            'audit_alternative': 1_360_000,
-            'power': 4_500_000,
-        })
-        self.assertEqual(diagnostics['total_pairs'], 27_516_000)
-        self.assertEqual(diagnostics['events_per_family'], 2)
-        self.assertAlmostEqual(
-            diagnostics['grid_bracket_curve_confidence'], 0.98)
+        def capture_grid(*args, **kwargs):
+            result = real_grid(*args, **kwargs)
+            constructed.append(np.asarray(result))
+            return result
+
+        for count in (5, 9):
+            argv = [
+                'alfd_eigval.py', '--version', '352515',
+                '--profile', 'production', '--preflight-only',
+                '--beta-count', str(count), '--workers', '1',
+            ]
+            with mock.patch.object(sys, 'argv', argv), \
+                    mock.patch.object(
+                        alfd, 'common_null_grid_3d', side_effect=capture_grid), \
+                    mock.patch.object(
+                        alfd, '_atomic_savez',
+                        side_effect=AssertionError('preflight wrote an artifact')), \
+                    mock.patch('builtins.print'):
+                alfd.main()
+
+        self.assertEqual(len(constructed), 2)
+        np.testing.assert_array_equal(constructed[0], constructed[1])
 
     def test_gkm_importance_estimator_is_ordinary_not_self_normalized(self):
         bank = self._synthetic_pooled_bank()
@@ -258,9 +239,11 @@ class PublicationWorkflowTests(unittest.TestCase):
             raw, alfd.tail_rejection_probabilities(scores, rule))
         self.assertAlmostEqual(attained, 0.5, places=14)
 
-        # Normalizing to unit realized mass would instead randomize the tie at
-        # one half and is not GKM equation (D.1).
-        normalized = alfd.calibrate_weighted_tail(scores, raw, alpha=0.5)
+        # Normalizing to unit realized mass instead changes the tie
+        # randomization and is not GKM equation (D.1).
+        normalized = alfd.calibrate_raw_weighted_tail(
+            scores, raw / raw.sum(), alpha=0.5)
+        self.assertEqual(normalized.threshold, 3.0)
         self.assertAlmostEqual(normalized.tie_probability, 0.5)
 
     def test_pooled_bank_cache_reuses_one_common_null_table(self):
@@ -292,10 +275,10 @@ class PublicationWorkflowTests(unittest.TestCase):
                     side_effect=fake_density) as density:
             first = alfd.build_or_load_pooled_is_bank(
                 grid, k_eff=7, n_per_stratum=n_per, seed=123,
-                cache_dir=directory, role='training')
+                cache_dir=directory, role='gkm')
             second = alfd.build_or_load_pooled_is_bank(
                 grid, k_eff=7, n_per_stratum=n_per, seed=123,
-                cache_dir=directory, role='training')
+                cache_dir=directory, role='gkm')
 
         self.assertEqual(simulate.call_count, H)
         density.assert_called_once()
@@ -312,30 +295,12 @@ class PublicationWorkflowTests(unittest.TestCase):
             alfd.gkm_importance_rejection_probabilities(
                 bank, np.ones(4))
 
-    def test_certification_requires_distinct_authenticated_banks(self):
-        training = self._synthetic_pooled_bank()
-        audit = self._synthetic_pooled_bank()
-        audit.role = 'audit'
-
-        with self.assertRaisesRegex(ValueError, 'distinct'):
-            alfd.alfd_eigval_bound_from_pooled_banks(
-                [3.0, 2.0, 1.0, 0.5], training, audit, k_eff=7,
-                verbose=False)
-
-        audit.bank_id = 'independent-audit-bank'
-        training.sampling_seed = 1
-        audit.sampling_seed = 2
-        with self.assertRaisesRegex(ValueError, 'authenticated'):
-            alfd.alfd_eigval_bound_from_pooled_banks(
-                [3.0, 2.0, 1.0, 0.5], training, audit, k_eff=7,
-                verbose=False)
-
-    def test_compressed_support_is_deterministic_and_renormalized(self):
-        active, weights, dropped = alfd.compress_mixture(
-            [0.1, 0.4, 0.4, 0.1], max_active=2)
-        np.testing.assert_array_equal(active, [1, 2])
-        np.testing.assert_allclose(weights, [0.5, 0.5])
-        self.assertAlmostEqual(dropped, 0.2)
+    def test_direct_path_rejects_non_gkm_bank_role(self):
+        bank = self._synthetic_pooled_bank()
+        bank.role = 'audit'
+        with self.assertRaisesRegex(ValueError, 'invalid pooled'):
+            alfd.gkm_importance_rejection_probabilities(
+                bank, np.ones(bank.eigs.shape[0]))
 
 
 class MHGBuildProvenanceTests(unittest.TestCase):
@@ -440,7 +405,7 @@ class MHGTests(unittest.TestCase):
         argv = [
             'alfd_eigval.py', '--version', '352515',
             '--profile', 'production', '--benchmark-preflight',
-            '--benchmark-samples', '1', '--beta-count', '1',
+            '--benchmark-samples', '1', '--beta-count', '3',
             '--workers', '1',
         ]
         with mock.patch.object(sys, 'argv', argv), \
@@ -458,8 +423,24 @@ class MHGTests(unittest.TestCase):
 
         run_benchmark.assert_called_once()
         self.assertEqual(run_benchmark.call_args.args[-1], 1)
-        self.assertEqual(len(run_benchmark.call_args.kwargs['fit_grids']), 1)
+        self.assertEqual(len(run_benchmark.call_args.kwargs['fit_grids']), 3)
         print_result.assert_called_once_with(benchmark_result)
+
+    def test_cli_rejects_removed_confidence_audit_and_compression_flags(self):
+        legacy_flags = (
+            '--curve-confidence', '--n-calibration', '--n-validation',
+            '--max-active-support', '--audit-seed')
+        for flag in legacy_flags:
+            argv = [
+                'alfd_eigval.py', '--version', '352515',
+                '--preflight-only', flag, '2',
+            ]
+            with self.subTest(flag=flag), \
+                    mock.patch.object(sys, 'argv', argv), \
+                    mock.patch.object(sys, 'stderr', io.StringIO()), \
+                    self.assertRaises(SystemExit) as raised:
+                alfd.main()
+            self.assertEqual(raised.exception.code, 2)
 
     def test_trailing_zero_collapse_is_not_convergence(self):
         broken = alfd.assess_mhg_series(
@@ -550,226 +531,151 @@ class MHGTests(unittest.TestCase):
 
 
 class EndToEndTests(unittest.TestCase):
-    def test_scalar_emw_bound_matches_exact_np_power(self):
-        result = alfd.alfd_eigval_bound(
-            (0.2,), [()], 7, alpha=0.05,
-            n_sim=500, n_sim_calibration=10_000,
-            n_sim_validation=2_000, n_sim_power=30_000,
-            n_iter=150, M_trunc=20, M_max=100, mhg_tol=1e-10,
-            seed=42, verbose=False, n_workers=1,
-            confidence_delta=0.05, return_result=True)
-        exact = float(ncx2.sf(chi2.ppf(0.95, 7), 7, 0.2))
-        self.assertAlmostEqual(result.point_rule.empirical_size, 0.05, places=13)
-        self.assertLess(abs(result.upper_point - exact), 0.012)
-        self.assertGreaterEqual(result.upper_confidence + 1e-12, exact)
-        self.assertGreaterEqual(result.upper_confidence, 0.05)
-        self.assertGreaterEqual(result.epsilon_grid_point, -1e-12)
+    def test_exact_rank_deficiency_result_is_alpha_on_full_grid(self):
+        exact = alfd._exact_gkm_result(alpha=0.05, G=68)
+        self.assertEqual(exact.bound, 0.05)
+        self.assertEqual(exact.mixture_power, 0.05)
+        self.assertEqual(exact.epsilon_grid, 0.0)
+        self.assertEqual(exact.mixture_rule.method,
+                         "exact_null_randomization")
+        self.assertEqual(exact.weights.shape, (68,))
+        self.assertEqual(exact.log_weights.shape, (68,))
+        self.assertEqual(exact.grid_rejection_probabilities.shape, (68,))
+        np.testing.assert_allclose(exact.weights, 1.0 / 68.0)
+        np.testing.assert_allclose(exact.log_weights, -np.log(68.0))
+        np.testing.assert_allclose(exact.grid_rejection_probabilities, 0.05)
 
-    def test_only_exact_rank_deficiency_uses_alpha_shortcut(self):
-        exact = alfd.alfd_eigval_bound(
-            (0.0,), [()], 7, return_result=True,
-            alternative_is_exact_null=True)
-        self.assertEqual(exact.upper_point, 0.05)
-        self.assertEqual(exact.point_rule.method, "exact_null_randomization")
-        with self.assertRaises(ValueError):
-            alfd.alfd_eigval_bound(
-                (1e-6,), [()], 7, alternative_is_exact_null=True)
-
-    def test_custom_validation_grid_is_augmented_with_fit_support(self):
-        fit = [(5.0, 2.0, 1.0), (3.0, 2.0, 0.0)]
-        custom = [(9.0, 4.0, 1.0)]
-        validated = alfd._validated_null_grid(custom, 3, "test grid")
-        union = alfd._union_null_grids(fit, validated)
-        self.assertEqual(union[:2], fit)
-        self.assertEqual(union[2:], custom)
+    def test_null_grid_validation_preserves_full_ordered_grid(self):
+        grid = [(5.0, 2.0, 1.0), (3.0, 2.0, 0.0)]
+        self.assertEqual(
+            alfd._validated_null_grid(grid, 3, "test grid"), grid)
 
 
 class ArtifactContractTests(unittest.TestCase):
-    def test_loader_accepts_only_new_confidence_artifact(self):
+    def test_direct_v4_checkpoint_and_artifact_keys(self):
+        grid = [(0.0, 0.0, 0.0), (1.0, 0.5, 0.0)]
+        fake_bank = mock.Mock(
+            bank_id="bank-id",
+            content_signature="a" * 64,
+            mhg_diagnostics={
+                "pairs": 8, "raw_evaluations": 8,
+                "order_counts": {20: 8}, "max_order": 20,
+                "max_remainder_ratio": 0.0,
+            })
+        rule = alfd.TailRule(0.0, 0.0, 0.05, "direct-gkm-test")
+        direct_result = alfd.GKMDirectResult(
+            bound=0.20, bound_se=0.01,
+            mixture_power=0.25, mixture_power_se=0.02,
+            epsilon_grid=0.05,
+            weights=np.array([0.4, 0.6]),
+            log_weights=np.log(np.array([0.4, 0.6])),
+            fit_rejection_probabilities=np.array([0.04, 0.05]),
+            grid_rejection_probabilities=np.array([0.05, 0.049]),
+            fit_iterations=1, mixture_rule=rule, grid_rule=rule,
+            importance_diagnostics={},
+            mhg_diagnostics={
+                "pairs": 4, "raw_evaluations": 4,
+                "order_counts": {20: 4}, "max_order": 20,
+                "max_remainder_ratio": 0.0,
+            })
+        writes = []
+        real_atomic_savez = alfd._atomic_savez
+
+        def record_save(path, **arrays):
+            writes.append((path, set(arrays)))
+            real_atomic_savez(path, **arrays)
+
+        argv = [
+            "alfd_eigval.py", "--version", "352515",
+            "--profile", "production", "--acknowledge-expensive",
+            "--n-fit", "2", "--n-power", "2", "--n-iter", "1",
+            "--grid-shapes", "1", "--grid-strengths", "1",
+            "--beta-count", "3", "--workers", "1",
+        ]
+        previous_directory = os.getcwd()
         with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "bound.npz")
-            source_hash = alfd._sha256_file(alfd.__file__)
-            core_hash = alfd._sha256_file(
-                os.path.join(alfd.MHG_DIR, "mhg_core.c"))
-            library_hash = alfd._sha256_file(os.path.join(
-                alfd.MHG_DIR,
-                "libmhg.dylib" if sys.platform == "darwin" else "libmhg.so"))
-            common_grid = [
-                [0.0, 0.0, 0.0],
-                [0.1, 0.05, 0.0],
-                [100.0, 50.0, 0.0],
-                [35.0, 25.0, 15.0],
-            ]
-            settings = dict(
-                schema_version=3,
-                algorithm="emw_eigval_gkm_is_adaptive_v3",
-                producer="alfd_eigval.py",
-                calibration_method="independent_mixture_quantile",
-                version_label="352515",
-                kappas=[35.0, 25.0, 15.0],
-                k=7, n=250, alpha=0.05,
-                curve_confidence=0.99, profile="production", beta_count=3,
-                fit_grid_strategy="strength_shape_3d_v1",
-                pooled_importance_method=(
-                    "gkm_stratified_equal_null_mixture_v1"),
-                confidence_allocation_method=(
-                    "two_event_upper_separate_two_event_grid_v1"),
-                common_grid=common_grid,
-                grid_shapes=1, grid_strengths=2, grid_max_strength=100.0,
-                grid_anchor_count=1,
-                max_active_support=2,
-                training_bank_seed=1234, audit_bank_seed=5678,
-                source_sha256=source_hash,
-                mhg_core_sha256=core_hash,
-                mhg_library_sha256=library_hash,
-                mhg_build_source_sha256=core_hash,
-            )
-            settings_json = json.dumps(settings, sort_keys=True)
-            run_signature = hashlib.sha256(json.dumps(
-                settings, sort_keys=True,
-                separators=(',', ':')).encode()).hexdigest()
-            payload = dict(
-                schema_version=np.array(3),
-                algorithm=np.array("emw_eigval_gkm_is_adaptive_v3"),
-                producer=np.array("alfd_eigval.py"),
-                calibration_method=np.array("independent_mixture_quantile"),
-                confidence_allocation_method=np.array(
-                    "two_event_upper_separate_two_event_grid_v1"),
-                bound_kind=np.array(
-                    "simultaneous_mc_confidence_upper_conditional_on_density_accuracy"),
-                confidence_scope=np.array("saved_beta_grid_only"),
-                density_accuracy_scope=np.array(
-                    "adaptive_empirical_tail_criterion"),
-                version_label=np.array("352515"),
-                kappas=np.array([35.0, 25.0, 15.0]),
-                k=np.array(7), n=np.array(250), alpha=np.array(0.05),
-                betas=np.array([-0.2, 0.0, 0.2]),
-                bounds=np.array([0.08, 0.05, 0.09]),
-                bounds_se=np.zeros(3),
-                common_null_grid=np.asarray(common_grid),
-                common_grid_size=np.array(4),
-                grid_shapes=np.array(1), grid_strengths=np.array(2),
-                grid_max_strength=np.array(100.0),
-                grid_anchor_count=np.array(1),
-                max_active_support=np.array(2),
-                active_support_count=np.array([2, 0, 2]),
-                discarded_weight_mass=np.array([0.1, 0.0, 0.05]),
-                gkm_point_upper=np.array([0.075, 0.05, 0.085]),
-                gkm_grid_lower=np.array([0.07, 0.05, 0.08]),
-                gkm_epsilon=np.array([0.005, 0.0, 0.005]),
-                source_sha256=np.array(source_hash),
-                mhg_core_sha256=np.array(core_hash),
-                mhg_library_sha256=np.array(library_hash),
-                mhg_build_source_sha256=np.array(core_hash),
-                curve_confidence=np.array(0.99),
-                settings_json=np.array(settings_json),
-                run_signature=np.array(run_signature),
-            )
-            np.savez(path, **payload)
-            betas, bounds, _ = load_compatible_alfd_bound(
-                path, version_label="352515", kappas=[35, 25, 15],
-                k=7, n=250, alpha=0.05)
-            np.testing.assert_array_equal(betas, payload["betas"])
-            np.testing.assert_array_equal(bounds, payload["bounds"])
-            _, _, _, metadata = load_compatible_alfd_bound(
-                path, version_label="352515", kappas=[35, 25, 15],
-                k=7, n=250, alpha=0.05, return_metadata=True)
-            self.assertEqual(metadata["curve_confidence"], 0.99)
-            self.assertEqual(metadata["profile"], "production")
-            self.assertEqual(metadata["common_grid_size"], 4)
-            self.assertEqual(metadata["grid_anchor_count"], 1)
-            self.assertEqual(metadata["max_active_support"], 2)
-            self.assertEqual(
-                metadata["pooled_importance_method"],
-                "gkm_stratified_equal_null_mixture_v1")
-            self.assertEqual(
-                metadata["confidence_allocation_method"],
-                "two_event_upper_separate_two_event_grid_v1")
+            try:
+                os.chdir(directory)
+                with mock.patch.object(sys, "argv", argv), \
+                        mock.patch.object(sys, "stdout", io.StringIO()), \
+                        mock.patch.object(sys, "stderr", io.StringIO()), \
+                        mock.patch.object(alfd, "verify_mhg"), \
+                        mock.patch.object(
+                            alfd, "asymptotic_ncp_eigenvalues",
+                            side_effect=lambda beta, *args: np.array(
+                                [0.35, 0.25, 0.15, 0.01 * abs(beta)])), \
+                        mock.patch.object(
+                            alfd, "common_null_grid_3d", return_value=grid), \
+                        mock.patch.object(
+                            alfd, "build_or_load_pooled_is_bank",
+                            return_value=fake_bank), \
+                        mock.patch.object(
+                            alfd, "gkm_eigval_bound_from_pooled_bank",
+                            return_value=direct_result) as direct_call, \
+                        mock.patch.object(
+                            alfd, "_atomic_savez", side_effect=record_save):
+                    alfd.main()
+                    sys.stdout._streams[-1].close()
+            finally:
+                os.chdir(previous_directory)
 
-            payload["run_signature"] = np.array("not-the-settings-signature")
-            np.savez(path, **payload)
-            with self.assertRaisesRegex(ValueError, "run_signature"):
-                load_compatible_alfd_bound(
-                    path, version_label="352515", kappas=[35, 25, 15],
-                    k=7, n=250, alpha=0.05)
-            payload["run_signature"] = np.array(run_signature)
+            artifact = os.path.join(
+                directory, "352515", "gkm_direct", "gkm_eigval_352515.npz")
+            partial = os.path.join(
+                directory, "352515", "gkm_direct",
+                "gkm_eigval_352515.partial.npz")
+            self.assertTrue(os.path.isfile(artifact))
+            self.assertFalse(os.path.exists(partial))
+            self.assertEqual(direct_call.call_count, 2)
 
-            wrong_count_settings = {**settings, "beta_count": 4}
-            payload["settings_json"] = np.array(json.dumps(
-                wrong_count_settings, sort_keys=True))
-            payload["run_signature"] = np.array(hashlib.sha256(json.dumps(
-                wrong_count_settings, sort_keys=True,
-                separators=(',', ':')).encode()).hexdigest())
-            np.savez(path, **payload)
-            with self.assertRaisesRegex(ValueError, "beta_count"):
-                load_compatible_alfd_bound(
-                    path, version_label="352515", kappas=[35, 25, 15],
-                    k=7, n=250, alpha=0.05)
-            payload["settings_json"] = np.array(settings_json)
-            payload["run_signature"] = np.array(run_signature)
+            checkpoint_required = {
+                "schema_version", "algorithm", "producer",
+                "calibration_method", "bound_kind", "version_label",
+                "run_signature", "settings_json", "kappas", "k", "n",
+                "alpha", "betas", "ncp", "bounds", "bounds_se",
+                "mixture_power", "mixture_power_se", "epsilon_grid",
+                "fitted_weights", "fitted_log_weights",
+                "fit_rejection_probabilities",
+                "grid_rejection_probabilities", "fit_iterations",
+                "max_m_used", "diagnostics_json",
+            }
+            partial_writes = [keys for path, keys in writes
+                              if path.endswith(".partial.npz")]
+            self.assertTrue(partial_writes)
+            for keys in partial_writes:
+                self.assertEqual(keys, checkpoint_required)
 
-            wrong_method_settings = {
-                **settings, "pooled_importance_method": "self_normalized_is"}
-            payload["settings_json"] = np.array(json.dumps(
-                wrong_method_settings, sort_keys=True))
-            payload["run_signature"] = np.array(hashlib.sha256(json.dumps(
-                wrong_method_settings, sort_keys=True,
-                separators=(',', ':')).encode()).hexdigest())
-            np.savez(path, **payload)
-            with self.assertRaisesRegex(ValueError, "pooled_importance_method"):
-                load_compatible_alfd_bound(
-                    path, version_label="352515", kappas=[35, 25, 15],
-                    k=7, n=250, alpha=0.05)
-            payload["settings_json"] = np.array(settings_json)
-            payload["run_signature"] = np.array(run_signature)
-
-            wrong_anchor_settings = {**settings, "grid_anchor_count": 0}
-            payload["settings_json"] = np.array(json.dumps(
-                wrong_anchor_settings, sort_keys=True))
-            payload["run_signature"] = np.array(hashlib.sha256(json.dumps(
-                wrong_anchor_settings, sort_keys=True,
-                separators=(',', ':')).encode()).hexdigest())
-            np.savez(path, **payload)
-            with self.assertRaisesRegex(ValueError, "grid_anchor_count"):
-                load_compatible_alfd_bound(
-                    path, version_label="352515", kappas=[35, 25, 15],
-                    k=7, n=250, alpha=0.05)
-            payload["settings_json"] = np.array(settings_json)
-            payload["run_signature"] = np.array(run_signature)
-
-            payload["common_null_grid"] = np.asarray(common_grid) + 1.0
-            np.savez(path, **payload)
-            with self.assertRaisesRegex(ValueError, "common_null_grid"):
-                load_compatible_alfd_bound(
-                    path, version_label="352515", kappas=[35, 25, 15],
-                    k=7, n=250, alpha=0.05)
-            payload["common_null_grid"] = np.asarray(common_grid)
-
-            saved_active_count = payload.pop("active_support_count")
-            np.savez(path, **payload)
-            with self.assertRaisesRegex(ValueError, "active_support_count"):
-                load_compatible_alfd_bound(
-                    path, version_label="352515", kappas=[35, 25, 15],
-                    k=7, n=250, alpha=0.05)
-            payload["active_support_count"] = saved_active_count
-
-            payload["schema_version"] = np.array(2)
-            payload["algorithm"] = np.array("emw_eigval_adaptive_v2")
-            np.savez(path, **payload)
-            with self.assertRaisesRegex(ValueError, "schema_version"):
-                load_compatible_alfd_bound(
-                    path, version_label="352515", kappas=[35, 25, 15],
-                    k=7, n=250, alpha=0.05)
-            payload["schema_version"] = np.array(3)
-            payload["algorithm"] = np.array(
-                "emw_eigval_gkm_is_adaptive_v3")
-
-            payload.pop("bound_kind")
-            np.savez(path, **payload)
-            with self.assertRaises(ValueError):
-                load_compatible_alfd_bound(
-                    path, version_label="352515", kappas=[35, 25, 15],
-                    k=7, n=250, alpha=0.05)
+            removed = {
+                "bounds_point", "bounds_confidence", "curve_confidence",
+                "confidence_scope", "confidence_allocation_method",
+                "n_calibration", "n_validation", "training_bank_id",
+                "audit_bank_id", "active_support_count",
+                "discarded_weight_mass", "retained_weights",
+                "retained_indices", "gkm_point_upper", "gkm_grid_lower",
+            }
+            with np.load(artifact, allow_pickle=False) as archive:
+                keys = set(archive.files)
+                self.assertTrue(checkpoint_required.issubset(keys))
+                self.assertTrue(removed.isdisjoint(keys))
+                self.assertEqual(int(archive["schema_version"]), 4)
+                self.assertEqual(str(archive["algorithm"]),
+                                 "gkm_eigval_mw3_adaptive_v4")
+                self.assertEqual(str(archive["calibration_method"]),
+                                 "gkm_step6_reused_pooled_bank")
+                self.assertEqual(str(archive["bound_kind"]),
+                                 "gkm_d3_2_grid_adjusted_mc_power_bound")
+                np.testing.assert_allclose(
+                    archive["mixture_power"] - archive["bounds"],
+                    archive["epsilon_grid"], atol=1e-15)
+                self.assertEqual(archive["fitted_weights"].shape, (3, 2))
+                self.assertEqual(
+                    archive["fitted_log_weights"].shape, (3, 2))
+                self.assertEqual(
+                    archive["grid_rejection_probabilities"].shape, (3, 2))
+                settings = json.loads(str(archive["settings_json"]))
+                self.assertEqual(settings["gkm_initial_mu"], -2.0)
+                self.assertEqual(settings["gkm_step_size"], 2.0)
+                self.assertTrue(removed.isdisjoint(settings))
 
     def test_dgp_cache_requires_full_settings_and_provenance(self):
         self.assertEqual(
@@ -806,7 +712,8 @@ class ArtifactContractTests(unittest.TestCase):
             np.savez(
                 path, betas=betas, power_chi2=curves[0],
                 power_c1=curves[1], power_cp1=curves[2])
-            with self.assertRaisesRegex(ValueError, "schema_version"):
+            with self.assertRaisesRegex(
+                    ValueError, "schema_version|metadata key"):
                 load_compatible_dgp_cache(
                     path, version_label="352515", kappas=[35, 25, 15],
                     k=7, n=250, alpha=0.05, betas=betas,

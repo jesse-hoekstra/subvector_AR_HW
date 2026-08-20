@@ -33,8 +33,8 @@ def rational_two_state_bank(base_weights=None, common_log_factor=None):
         base_weights=np.asarray(base_weights, dtype=float),
         strata=strata,
         n_per_stratum=10,
-        role="training",
-        bank_id="rational-two-state-training",
+        role="gkm",
+        bank_id="rational-two-state-gkm",
     )
 
 
@@ -46,8 +46,8 @@ class RawTailCalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(rule.tie_probability, 0.25)
         self.assertAlmostEqual(rule.empirical_size, 0.25)
 
-        normalized = alfd.calibrate_weighted_tail(
-            [3.0, 2.0, 1.0], [0.2, 0.2, 0.2], alpha=0.25)
+        normalized = alfd.calibrate_raw_weighted_tail(
+            [3.0, 2.0, 1.0], np.full(3, 1.0 / 3.0), alpha=0.25)
         self.assertEqual(normalized.threshold, 3.0)
         self.assertAlmostEqual(normalized.tie_probability, 0.75)
 
@@ -72,7 +72,7 @@ class RawTailCalibrationTests(unittest.TestCase):
 
 class PooledISBankTests(unittest.TestCase):
     @staticmethod
-    def _authenticated_banks():
+    def _authenticated_bank():
         grid = np.array([[0.0, 0.0, 0.0], [1.0, 0.5, 0.1]])
 
         def fake_density(eigs, omegas, *args, **kwargs):
@@ -89,11 +89,9 @@ class PooledISBankTests(unittest.TestCase):
 
         with mock.patch.object(
                 alfd, "log_eigval_density_partial", side_effect=fake_density):
-            training = alfd.build_or_load_pooled_is_bank(
-                grid, 7, 2, 101, role="training")
-            audit = alfd.build_or_load_pooled_is_bank(
-                grid, 7, 2, 202, role="audit")
-        return training, audit
+            bank = alfd.build_or_load_pooled_is_bank(
+                grid, 7, 2, 101, role="gkm")
+        return bank
 
     def test_rational_bank_recovers_both_target_probabilities(self):
         bank = rational_two_state_bank()
@@ -116,12 +114,12 @@ class PooledISBankTests(unittest.TestCase):
             rtol=2e-14, atol=0.0)
 
         log_g = np.log(np.where(base.eigs[:, 0] == 1.0, 0.4, 0.6))
-        fit = alfd.fit_emw_weights_is(
+        fit = alfd.fit_gkm_weights_is(
             base, log_g, alpha=0.25, n_iter=20,
-            convergence_patience=2)
-        shifted_fit = alfd.fit_emw_weights_is(
+            step_size=2.0)
+        shifted_fit = alfd.fit_gkm_weights_is(
             shifted, log_g + offset, alpha=0.25, n_iter=20,
-            convergence_patience=2)
+            step_size=2.0)
         np.testing.assert_allclose(fit.weights, shifted_fit.weights, atol=2e-14)
         np.testing.assert_allclose(
             fit.rejection_probabilities,
@@ -145,10 +143,10 @@ class PooledISBankTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bank"):
             alfd._validate_pooled_is_bank(bank)
 
-    def test_stratum_order_must_match_audit_reshape_contract(self):
+    def test_stratum_order_must_match_common_bank_contract(self):
         bank = rational_two_state_bank()
         bank.strata = np.roll(bank.strata, 1)
-        with self.assertRaisesRegex(ValueError, "strata"):
+        with self.assertRaisesRegex(ValueError, "pooled"):
             alfd._validate_pooled_is_bank(bank)
 
     def test_noninteger_strata_are_not_silently_truncated(self):
@@ -175,7 +173,7 @@ class PooledISBankTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
                 alfd, "log_eigval_density_partial", side_effect=fake_density):
             alfd.build_or_load_pooled_is_bank(
-                grid, 7, 2, 1234, role="training", cache_dir=directory)
+                grid, 7, 2, 1234, role="gkm", cache_dir=directory)
             paths = [os.path.join(directory, name)
                      for name in os.listdir(directory) if name.endswith(".npz")]
             self.assertEqual(len(paths), 1)
@@ -187,31 +185,40 @@ class PooledISBankTests(unittest.TestCase):
             np.savez(path, **payload)
             with self.assertRaisesRegex(RuntimeError, "settings"):
                 alfd.build_or_load_pooled_is_bank(
-                    grid, 7, 2, 1234, role="training", cache_dir=directory)
+                    grid, 7, 2, 1234, role="gkm", cache_dir=directory)
 
-    def test_certification_rejects_density_setting_mismatch(self):
-        training, audit = self._authenticated_banks()
+    def test_mhg_diagnostics_allow_order_zero_analytic_shortcuts(self):
+        diagnostics = {
+            "pairs": 8,
+            "raw_evaluations": 4,
+            "order_counts": {0: 4, 20: 4},
+            "max_order": 20,
+            "max_remainder_ratio": 0.0,
+        }
+        canonical = alfd._canonical_pooled_mhg_diagnostics(
+            diagnostics, expected_pairs=8)
+        self.assertEqual(canonical, (
+            '{"max_order":20,"max_remainder_ratio":0.0,'
+            '"order_counts":{"0":4,"20":4},"pairs":8,'
+            '"raw_evaluations":4}'))
+
+        invalid = {**diagnostics, "raw_evaluations": 3}
+        with self.assertRaisesRegex(ValueError, "inconsistent"):
+            alfd._canonical_pooled_mhg_diagnostics(
+                invalid, expected_pairs=8)
+
+    def test_direct_path_rejects_density_setting_mismatch(self):
+        bank = self._authenticated_bank()
         with self.assertRaisesRegex(ValueError, "adaptive-M"):
-            alfd.alfd_eigval_bound_from_pooled_banks(
-                [3.0, 2.0, 1.0, 0.5], training, audit, 7,
+            alfd.gkm_eigval_bound_from_pooled_bank(
+                [3.0, 2.0, 1.0, 0.5], bank, 7,
                 M_trunc=21, verbose=False)
 
-    def test_distinct_metadata_cannot_disguise_duplicate_bank_content(self):
-        training, audit = self._authenticated_banks()
-        for name in ("grid", "eigs", "log_f", "log_q", "base_weights",
-                     "strata"):
-            setattr(audit, name, np.asarray(getattr(training, name)).copy())
-        audit.mhg_diagnostics = dict(training.mhg_diagnostics)
-        diagnostics_json = alfd._canonical_pooled_mhg_diagnostics(
-            audit.mhg_diagnostics, audit.log_f.size)
-        audit.content_signature = alfd._pooled_bank_content_signature(
-            grid=audit.grid, eigs=audit.eigs, log_f=audit.log_f,
-            log_q=audit.log_q, base_weights=audit.base_weights,
-            strata=audit.strata, diagnostics_json=diagnostics_json)
-        with self.assertRaisesRegex(ValueError, "identical numeric content"):
-            alfd.alfd_eigval_bound_from_pooled_banks(
-                [3.0, 2.0, 1.0, 0.5], training, audit, 7,
-                verbose=False)
+    def test_authenticated_bank_rejects_tampered_content_signature(self):
+        bank = self._authenticated_bank()
+        bank.content_signature = "0" * 64
+        with self.assertRaisesRegex(ValueError, "content signature"):
+            alfd._authenticated_pooled_bank_settings(bank)
 
     def test_authenticated_pooled_path_runs_end_to_end(self):
         grid = [(0.0, 0.0, 0.0), (2.0, 1.0, 0.2)]
@@ -233,33 +240,78 @@ class PooledISBankTests(unittest.TestCase):
         with mock.patch.object(
                 alfd, "log_eigval_density_partial",
                 side_effect=fake_density):
-            training = alfd.build_or_load_pooled_is_bank(
-                grid, 7, 100, 101, role="training")
-            audit = alfd.build_or_load_pooled_is_bank(
-                grid, 7, 100, 202, role="audit")
-            result = alfd.alfd_eigval_bound_from_pooled_banks(
-                [0.1, 0.08, 0.04, 0.01], training, audit, 7,
-                n_sim_calibration=500, n_sim_power=500, n_iter=20,
-                max_active_support=2, seed=303, confidence_delta=0.4,
-                verbose=False)
+            bank = alfd.build_or_load_pooled_is_bank(
+                grid, 7, 100, 101, role="gkm")
+            result = alfd.gkm_eigval_bound_from_pooled_bank(
+                [0.1, 0.08, 0.04, 0.01], bank, 7,
+                n_sim_power=500, n_iter=20, seed=303, verbose=False)
 
-        self.assertAlmostEqual(result.point_rule.empirical_size, 0.05)
-        self.assertGreaterEqual(result.upper_confidence, 0.05)
-        self.assertLessEqual(result.lower_grid_point, result.upper_point)
-        self.assertLessEqual(result.gkm_grid_lower, result.gkm_point_upper)
-        self.assertEqual(result.weights.shape, (2,))
-        self.assertEqual(result.full_weights.shape, (2,))
+        self.assertAlmostEqual(result.mixture_rule.empirical_size, 0.05)
+        self.assertLessEqual(result.bound, result.mixture_power + 1e-12)
+        self.assertAlmostEqual(
+            result.epsilon_grid, result.mixture_power - result.bound,
+            places=14)
+        self.assertEqual(result.weights.shape, (len(grid),))
+        self.assertEqual(
+            result.fit_rejection_probabilities.shape, (len(grid),))
+        self.assertEqual(
+            result.grid_rejection_probabilities.shape, (len(grid),))
+        self.assertLessEqual(
+            float(np.max(result.grid_rejection_probabilities)),
+            0.05 + 2e-12)
+        self.assertEqual(result.fit_iterations, 20)
+
+    def test_fixed_mu_update_matches_gkm_four_iteration_regression(self):
+        bank = rational_two_state_bank()
+        log_g = np.where(bank.eigs[:, 0] == 1.0, -0.75, -4.0)
+
+        fit = alfd.fit_gkm_weights_is(
+            bank, log_g, alpha=0.25, n_iter=4, step_size=2.0)
+
+        # Starting from (-2, -2), the four rejection vectors are state 0,
+        # state 0, empty, empty. Their exact null probabilities are (.8,.2),
+        # (.8,.2), (0,0), and (0,0), respectively.
+        np.testing.assert_allclose(fit.mu, [-0.8, -3.2],
+                                   rtol=0.0, atol=5e-15)
+        np.testing.assert_allclose(
+            fit.weights, alfd._softmax([-0.8, -3.2]),
+            rtol=0.0, atol=5e-15)
+        self.assertEqual(fit.iterations, 4)
+
+    def test_full_support_scoring_survives_reported_weight_underflow(self):
+        density = np.array([
+            [1e3, 1e3, 1e-300, 1e-300],
+            [1e-300, 1e-300, 1e3, 1e3],
+        ])
+        proposal = density.mean(axis=0)
+        bank = alfd.PooledISBank(
+            grid=np.array([[2.0, 1.0, 0.0], [1.0, 0.5, 0.0]]),
+            eigs=np.zeros((4, 4)), log_f=np.log(density),
+            log_q=np.log(proposal), base_weights=np.full(4, 0.25),
+            strata=np.array([0, 0, 1, 1]), n_per_stratum=2,
+            role="gkm", bank_id="underflow-test")
+        log_g = np.log(np.array([1e300, 1e300, 1e-300, 1e-300]))
+
+        fit = alfd.fit_gkm_weights_is(
+            bank, log_g, alpha=0.05, n_iter=600, step_size=2.0)
+
+        self.assertEqual(fit.weights[1], 0.0)
+        self.assertTrue(np.all(np.isfinite(fit.log_weights)))
+        self.assertAlmostEqual(float(np.logaddexp.reduce(fit.log_weights)),
+                               0.0, places=14)
+        # The second null row has a compensatingly large density.  Scoring
+        # from exponentiated weights would silently delete it, while the
+        # authoritative log weights retain the full-H GKM mixture.
+        log_densities = np.array([[0.0], [800.0], [0.0]])
+        score = alfd._score_from_log_densities(
+            log_densities, log_weights=fit.log_weights)
+        dropped_score = alfd._score_from_log_densities(
+            log_densities, fit.weights)
+        self.assertLess(float(score[0]), -50.0)
+        self.assertAlmostEqual(float(dropped_score[0]), 0.0, places=14)
 
 
-class CompressionAndGridTests(unittest.TestCase):
-    def test_compression_retains_indices_and_alignment(self):
-        active, retained, dropped = alfd.compress_mixture(
-            [0.10, 0.60, 0.05, 0.25], max_active=2)
-        np.testing.assert_array_equal(active, [1, 3])
-        np.testing.assert_allclose(retained, [0.60 / 0.85, 0.25 / 0.85])
-        self.assertAlmostEqual(dropped, 0.15)
-        self.assertAlmostEqual(float(retained.sum()), 1.0)
-
+class GridTests(unittest.TestCase):
     def test_common_grid_is_ordered_and_has_declared_size(self):
         grid = np.asarray(alfd.common_null_grid_3d(
             [[10.0, 4.0, 1.0], [8.0, 5.0, 2.0]],
@@ -274,18 +326,14 @@ class CompressionAndGridTests(unittest.TestCase):
 class DriverAndAccountingTests(unittest.TestCase):
     def test_shared_pair_accounting_counts_null_tables_once(self):
         budget = dict(
-            n_fit=10, n_calibration=2000, n_validation=2000,
-            n_power=2000, n_iter=5, validation_grid_size=3)
-        result = alfd._common_is_budget_diagnostics(
-            alpha=0.05, curve_confidence=0.90, common_grid_size=3,
-            n_nonnull=2, max_active_support=2, budget=budget)
+            n_fit=10, n_power=2000, n_iter=5)
+        result = alfd._gkm_budget_diagnostics(
+            alpha=0.05, common_grid_size=3,
+            n_nonnull=2, budget=budget)
         expected = {
-            "shared_fit_null": 3 * 3 * 10,
-            "fit_alternative": 2 * 3 * 10,
-            "calibration": 2 * (2 + 1) * 2000,
-            "shared_audit_null": 3 * 3 * 2000,
-            "audit_alternative": 2 * 3 * 2000,
-            "power": 2 * (2 + 1) * 2000,
+            "shared_null_bank": 3 * 3 * 10,
+            "beta_training_alternative": 2 * 3 * 10,
+            "beta_power": 2 * (3 + 1) * 2000,
         }
         self.assertEqual(result["phase_pairs"], expected)
         self.assertEqual(result["total_pairs"], sum(expected.values()))
@@ -293,7 +341,9 @@ class DriverAndAccountingTests(unittest.TestCase):
     def test_production_driver_calls_pooled_path(self):
         source = inspect.getsource(alfd.main)
         self.assertNotIn("prepared_grids", source)
-        self.assertIn("alfd_eigval_bound_from_pooled_banks(", source)
+        self.assertIn("gkm_eigval_bound_from_pooled_bank(", source)
+        self.assertNotIn("alfd_eigval_bound_from_pooled_banks(", source)
+        self.assertNotIn("compress_mixture(", source)
 
 
 if __name__ == "__main__":
