@@ -117,14 +117,11 @@ the watcher inspects any older completed artifact, especially when using
 It validates the signed DGP cache, polls the atomically written ALFD
 checkpoint, saves a local progress PNG and long-format CSV under
 `352515/adaptive/`, and uploads the same overlay after every completed beta.
-The protected
-`bounds_confidence` curve is shown as the primary EMW upper; the paper-style
-point estimate is dashed. A crossing of the finite-sample `power_cp1` curve is
-highlighted as a diagnostic warning, not treated as an automatic stopping
-rule, because the finite-sample estimated-covariance simulation and the
-known-covariance limit experiment are not identical. The same-experiment
-benchmark lower confidence endpoint is also plotted and is the formal
-implementation check.
+The figure contains only the three cached curves, labelled $\chi^2$, $c_1$,
+and $c_3$, the simultaneous-confidence `bounds_confidence` EMW upper, and a
+gray horizontal $\alpha$ reference line.
+Additional point-estimate, grid, and implementation diagnostics remain in the
+NPZ/CSV outputs but are deliberately omitted from the presentation plot.
 
 To test only the W&B plumbing in a few seconds, without a DGP cache or any
 matrix-hypergeometric work, run:

@@ -326,6 +326,15 @@ class PlotTests(unittest.TestCase):
                           np.asarray(line.get_ydata(), dtype=float))
                          for line in axes.lines]
 
+            self.assertEqual(len(axes.lines), 5)
+            self.assertEqual(
+                [line.get_label() for line in axes.lines],
+                [r"$\chi^2$", r"$c_1$", r"$c_3$",
+                 "EMW upper bound (95% simultaneous confidence)",
+                 r"$\alpha=0.05$"])
+            self.assertEqual(len(axes.collections), 0)
+            self.assertEqual(len(axes.texts), 0)
+
             for curve in (dgp.power_chi2, dgp.power_c1, dgp.power_cp1):
                 self.assertTrue(any(
                     x.shape == dgp.betas.shape
@@ -338,6 +347,12 @@ class PlotTests(unittest.TestCase):
                 np.array_equal(x, progress.betas[complete])
                 and np.array_equal(y, progress.bounds_confidence[complete])
                 for x, y in line_data))
+            self.assertFalse(any(
+                np.array_equal(y, progress.bounds_point[complete])
+                for _, y in line_data))
+            self.assertFalse(any(
+                np.array_equal(y, progress.benchmark_lower_confidence[complete])
+                for _, y in line_data))
             self.assertEqual(metrics["completed_beta_count"], 3)
 
     def test_png_publish_is_atomic_and_preserves_old_file_on_render_failure(self):
@@ -382,6 +397,7 @@ class PlotTests(unittest.TestCase):
             self.assertEqual(metrics["completed_beta_count"], 0)
             self.assertEqual(metrics["total_beta_count"], 3)
             self.assertIn("live: 0/3 betas", figure.axes[0].get_title())
+            self.assertEqual(len(figure.axes[0].lines), 5)
 
             output = os.path.join(directory, "waiting.png")
             with mock.patch("builtins.print"):

@@ -5,11 +5,9 @@ network failures must never interrupt, slow, or change the numerical run.  It
 polls the atomically published partial checkpoint and switches to the final
 artifact once that artifact is compatible with the same run.
 
-The finite-sample Appendix A.3 curves and the asymptotic EMW curve are not the
-same statistical experiment.  Their overlay is therefore a useful diagnostic,
-not a theorem-level bound check.  The invariant benchmark stored by
-``alfd_eigval.py`` *is* from the bound calculation's experiment and is shown
-separately.
+The plot deliberately stays presentation-focused: it shows the three cached
+DGP curves and the primary confidence-valid EMW upper bound.  Additional
+diagnostics remain available in the exported values and metrics.
 """
 
 from __future__ import annotations
@@ -539,46 +537,28 @@ def build_progress_figure(
     metrics = _progress_metrics(dgp, progress)
     figure, axis = plt.subplots(figsize=(10, 6))
     axis.plot(dgp.betas, dgp.power_chi2, color="tab:blue", linewidth=1.5,
-              label=r"Feasible $\chi^2$ curve (finite-sample DGP)")
+              label=r"$\chi^2$")
     axis.plot(dgp.betas, dgp.power_c1, color="tab:orange", linewidth=1.5,
-              label=r"Feasible $\phi_{c_1}$ / power_c1 (finite-sample DGP)")
+              label=r"$c_1$")
     axis.plot(dgp.betas, dgp.power_cp1, color="tab:red", linewidth=2.2,
-              label=(r"Feasible $\phi_{c_{p-1}}$ / power_cp1 "
-                     r"(finite-sample DGP)"))
+              label=r"$c_3$")
 
     if progress is not None:
         complete = np.isfinite(progress.bounds_confidence)
         beta = progress.betas[complete]
         confidence = progress.bounds_confidence[complete]
-        point = progress.bounds_point[complete]
-        benchmark = progress.benchmark_lower_confidence[complete]
         confidence_level = None
         if progress.settings is not None:
             confidence_level = progress.settings.get("curve_confidence")
-        level = ("confidence-valid" if confidence_level is None
-                 else f"{float(confidence_level):.0%} simultaneous-MC")
-        axis.plot(beta, confidence, color="green", marker="o", linewidth=2.4,
-                  markersize=6, label=f"EMW upper ({level}; primary)")
-        axis.plot(beta, point, color="green", marker=".", linestyle="--",
-                  linewidth=1.4, label="EMW paper-style point estimate")
-        axis.plot(beta, benchmark, color="purple", marker="^", linestyle=":",
-                  linewidth=1.5,
-                  label="Invariant benchmark lower (same experiment)")
-
-        if beta.size:
-            cp1 = np.interp(beta, dgp.betas, dgp.power_cp1)
-            crossed = confidence < cp1 - 1e-12
-            if np.any(crossed):
-                axis.vlines(beta[crossed], confidence[crossed], cp1[crossed],
-                            colors="crimson", linestyles="--", alpha=0.65)
-                axis.scatter(
-                    beta[crossed], confidence[crossed], marker="x", s=90,
-                    linewidths=2.2, color="crimson", zorder=6,
-                    label="Cross-experiment crossing (diagnostic only)")
+        label = "EMW upper bound"
+        if confidence_level is not None:
+            label += f" ({float(confidence_level):.0%} simultaneous confidence)"
+        axis.plot(beta, confidence, color="green", marker="o",
+                  linewidth=2.4, markersize=6, label=label)
 
     alpha = float(dgp.settings["alpha"])
     axis.axhline(alpha, color="gray", linestyle=":", linewidth=1.0,
-                 label=rf"Size $\alpha={alpha:g}$")
+                 label=rf"$\alpha={alpha:g}$")
     axis.set_xlabel(r"True $\beta$")
     axis.set_ylabel("Rejection probability / power")
     completed = metrics["completed_beta_count"]
@@ -598,10 +578,7 @@ def build_progress_figure(
         if np.any(complete):
             plotted_max = max(
                 plotted_max,
-                float(np.max(progress.bounds_confidence[complete])),
-                float(np.max(progress.bounds_point[complete])),
-                float(np.max(
-                    progress.benchmark_lower_confidence[complete])))
+                float(np.max(progress.bounds_confidence[complete])))
     axis.set_ylim(0.0, min(1.02, max(0.15, plotted_max + 0.05)))
     x_min = float(dgp.betas[0])
     x_max = float(dgp.betas[-1])
@@ -610,13 +587,6 @@ def build_progress_figure(
         x_max = max(x_max, float(progress.betas[-1]))
     axis.set_xlim(x_min, x_max)
     axis.grid(True, alpha=0.25)
-    axis.text(
-        0.01, 0.99,
-        "DGP curves and EMW bounds are from different experiments.\n"
-        "A crossing is an early diagnostic warning, not a formal bound violation.",
-        transform=axis.transAxes, va="top", ha="left", fontsize=8.5,
-        color="darkred", bbox=dict(facecolor="white", edgecolor="lightcoral",
-                                    alpha=0.88, boxstyle="round,pad=0.35"))
     axis.legend(loc="best", fontsize=8)
     figure.tight_layout()
     return figure, metrics
