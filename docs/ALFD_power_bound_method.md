@@ -500,7 +500,108 @@ different experiments is not a theorem. The same-limit-experiment
 smallest-eigenvalue benchmark stored by `alfd_eigval.py` is the relevant
 implementation invariant.
 
-## 11. Publication checklist
+## 11. Live local and Weights & Biases monitoring
+
+`watch_power_progress.py` is a read-only sidecar for a long production run. It
+does not import W&B into `alfd_eigval.py`, alter a simulation seed, or write a
+scientific checkpoint. This separation is intentional: the numerical driver
+repeatedly creates large multiprocessing pools, whereas W&B owns network and
+background-process state.
+
+Before starting the bound, create or validate the canonical finite-sample DGP
+cache. The watcher never launches these simulations implicitly:
+
+```bash
+python3 new_power_comparison.py \
+  --version 352515 \
+  --num-simulations 100000 \
+  --workers 48 \
+  --seed 20240101 \
+  --chunk-size 5000 \
+  --acknowledge-expensive
+```
+
+Run the bound in one `tmux` pane and the watcher in another:
+
+```bash
+# Numerical pane: use the exact settings accepted after preflight/benchmark.
+python3 alfd_eigval.py \
+  --version 352515 \
+  --profile production \
+  --workers 48 \
+  --beta-count 11 \
+  --curve-confidence .95 \
+  --n-fit 2000 \
+  --n-calibration 50000 \
+  --n-validation 2000 \
+  --n-power 100000 \
+  --n-iter 600 \
+  --grid-shapes 9 \
+  --grid-strengths 7 \
+  --grid-max-strength 100 \
+  --max-active-support 8 \
+  --acknowledge-expensive
+
+# Monitoring pane (one-time setup: pip install wandb; wandb login).
+python3 watch_power_progress.py \
+  --version 352515 \
+  --wandb-project subvector-ar-hw \
+  --wandb-mode online
+```
+
+Start the numerical command first, then start the watcher after the driver has
+printed its run signature and created the initial partial checkpoint. This is
+especially important for an intentional `--force` rerun: starting the watcher
+too early could show a still-present completed artifact from the preceding run.
+
+The bound driver writes an authenticated initial partial checkpoint before it
+starts the shared null banks, then replaces that file atomically after every
+completed beta. The watcher validates the signed DGP cache and checkpoint,
+plots all three `simulate_power_dgp` curves, and overlays only finite completed
+bound points. It writes an atomic local PNG and a tidy long-format CSV with
+every plotted value even when W&B uploading later fails. The authoritative
+inputs remain the signed DGP and partial/final bound NPZ files; the CSV is a
+human-readable joined view of their different beta grids. The watcher resumes
+the W&B run from the statistical run signature; an intentionally new rerun can
+instead be given a distinct `--wandb-run-id`.
+
+The W&B path itself can be tested without a DGP cache, checkpoint, or any
+matrix-hypergeometric calculation:
+
+```bash
+python3 watch_power_progress.py \
+  --version 352515 \
+  --demo \
+  --wandb-project subvector-ar-hw \
+  --wandb-mode online
+```
+
+This sends six progressive synthetic snapshots in a few seconds. The plot,
+W&B run name/configuration, run ID, CSV rows, and output directory are all
+marked `SYNTHETIC DEMO`; default files go only under
+`352515/adaptive/demo/`. These values are a telemetry test, not a power bound.
+
+The primary green curve is `bounds_confidence`, the simultaneous-Monte-Carlo
+upper conditional on density accuracy. `bounds_point` is shown dashed and is
+not the protected endpoint. `power_cp1` is highlighted because it is normally
+the largest of the three feasible DGP curves. The displayed interpolated gap
+to `power_cp1` is a cross-experiment diagnostic only: those DGP simulations
+use finite $n=250$ and estimated residual covariance, whereas the bound is for
+the known-covariance Gaussian limit experiment. Consequently the watcher does
+not stop the run automatically. `invariant_benchmark_lower_confidence` is
+computed in the same limit experiment; if it exceeded `bounds_confidence`,
+that would be a genuine failure, and the numerical driver itself refuses such
+a result before checkpointing it.
+
+One timing limitation is important. Both beta-invariant shared null banks are
+built before the beta loop, so the baseline plot appears immediately but the
+first non-null bound point appears only after that shared startup work. On the
+measured weak-configuration machine this can still take several days. Once the
+loop begins, every atomically completed beta appears without waiting for the
+rest of the curve. Use Ctrl-C for a manual stop; the compatible partial
+checkpoint and bank caches are designed to resume without `--force`.
+
+## 12. Publication checklist
 
 Before treating a run as reportable, verify:
 

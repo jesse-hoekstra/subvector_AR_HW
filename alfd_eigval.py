@@ -3397,20 +3397,6 @@ def main():
 
     t_total = time.time()
 
-    # These beta-invariant null tables are the principal GKM computational
-    # reuse.  Their cache keys authenticate the grid, RNG stream, adaptive-M
-    # settings and current density implementation.
-    training_bank = build_or_load_pooled_is_bank(
-        common_grid, k, budget['n_fit'], training_bank_seed,
-        M_start=M_start, M_step=args.m_step, M_max=args.m_max,
-        mhg_tol=args.mhg_rtol, n_workers=n_workers, role="training",
-        cache_dir=out_dir, cache_metadata=provenance)
-    audit_bank = build_or_load_pooled_is_bank(
-        common_grid, k, budget['n_validation'], audit_bank_seed,
-        M_start=M_start, M_step=args.m_step, M_max=args.m_max,
-        mhg_tol=args.mhg_rtol, n_workers=n_workers, role="audit",
-        cache_dir=out_dir, cache_metadata=provenance)
-
     bounds_confidence = np.full(n_betas, np.nan)
     bounds_point = np.full(n_betas, np.nan)
     bounds_point_se = np.full(n_betas, np.nan)
@@ -3455,6 +3441,20 @@ def main():
         retained_weights=retained_weights,
         retained_indices=retained_indices,
         diagnostics_json=diagnostics_json)
+    checkpoint_metadata = dict(
+        schema_version=np.array(RESULT_SCHEMA_VERSION),
+        algorithm=np.array(ALGORITHM_VERSION),
+        producer=np.array('alfd_eigval.py'),
+        calibration_method=np.array(CALIBRATION_METHOD),
+        confidence_allocation_method=np.array(
+            CONFIDENCE_ALLOCATION_METHOD),
+        bound_kind=np.array(BOUND_KIND),
+        version_label=np.array(args.version),
+        run_signature=np.array(run_signature),
+        settings_json=np.array(json.dumps(run_settings, sort_keys=True)),
+        kappas=np.asarray(kappas, dtype=float),
+        k=np.array(k), n=np.array(n), alpha=np.array(alpha),
+        curve_confidence=np.array(args.curve_confidence))
     if os.path.isfile(partial_npz) and not args.force:
         try:
             with np.load(partial_npz, allow_pickle=False) as checkpoint:
@@ -3471,6 +3471,30 @@ def main():
                 "to start this adaptive run again.") from exc
         print(f"  resumed {np.count_nonzero(np.isfinite(bounds_confidence))}/"
               f"{n_betas} beta points from {partial_npz}")
+
+    # Publish an authenticated, all-NaN (or resumed) checkpoint before the
+    # shared-bank construction begins.  A read-only progress watcher can then
+    # display the cached feasible curves immediately without importing W&B or
+    # any network state into this numerical multiprocessing process.
+    _atomic_savez(
+        partial_npz, **checkpoint_metadata,
+        betas=betas_alfd, ncp=ncp_table,
+        **{name: value for name, value in checkpoint_arrays.items()})
+
+    # These beta-invariant null tables are the principal GKM computational
+    # reuse.  Their cache keys authenticate the grid, RNG stream, adaptive-M
+    # settings and current density implementation.
+    training_bank = build_or_load_pooled_is_bank(
+        common_grid, k, budget['n_fit'], training_bank_seed,
+        M_start=M_start, M_step=args.m_step, M_max=args.m_max,
+        mhg_tol=args.mhg_rtol, n_workers=n_workers, role="training",
+        cache_dir=out_dir, cache_metadata=provenance)
+    audit_bank = build_or_load_pooled_is_bank(
+        common_grid, k, budget['n_validation'], audit_bank_seed,
+        M_start=M_start, M_step=args.m_step, M_max=args.m_max,
+        mhg_tol=args.mhg_rtol, n_workers=n_workers, role="audit",
+        cache_dir=out_dir, cache_metadata=provenance)
+
     beta_times = []
 
     for i, b in enumerate(betas_alfd):
@@ -3572,7 +3596,7 @@ def main():
         diagnostics_json[i] = diagnostic_record
 
         _atomic_savez(
-            partial_npz, run_signature=np.array(run_signature),
+            partial_npz, **checkpoint_metadata,
             betas=betas_alfd, ncp=ncp_table,
             **{name: value for name, value in checkpoint_arrays.items()})
 

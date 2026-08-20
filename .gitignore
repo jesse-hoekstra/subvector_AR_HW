@@ -21,3 +21,10 @@ koev/mhg_page.html
 
 # Run artifacts and generated outputs
 *.log
+
+# Weights & Biases local run metadata (authenticate outside the repository)
+wandb/
+.wandb/
+**/adaptive/live_power_progress_*.png
+**/adaptive/live_power_progress_*.csv
+**/adaptive/demo/

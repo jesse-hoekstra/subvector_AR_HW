@@ -21,6 +21,7 @@ The repository also contains the calibrated EMW/GKM power-bound workflow in
   - numpy
   - scipy
   - matplotlib
+  - wandb (optional; only for the live power-bound dashboard)
 
 Install the dependencies in a virtual environment:
 
@@ -81,6 +82,63 @@ point. See
 `docs/ALFD_power_bound_method.md` for the formulas, interpretation of the two
 upper endpoints, target-machine timing benchmark, exact simulation-budget
 diagnostics, and the limitation of a finite grid when `m_W=3`.
+
+### Follow a long bound run live
+
+The W&B integration is deliberately a separate read-only watcher. This keeps
+W&B network activity and background processes out of the numerical program's
+multiprocessing pools. First create or validate the finite-sample DGP cache:
+
+```bash
+python3 new_power_comparison.py \
+  --version 352515 \
+  --num-simulations 100000 \
+  --workers 48 \
+  --seed 20240101 \
+  --chunk-size 5000 \
+  --acknowledge-expensive
+```
+
+Then, in a second `tmux` pane or terminal, start the watcher:
+
+```bash
+python3 -m pip install wandb
+wandb login
+python3 watch_power_progress.py \
+  --version 352515 \
+  --wandb-project subvector-ar-hw \
+  --wandb-mode online
+```
+
+Start the numerical driver first so its new partial checkpoint exists before
+the watcher inspects any older completed artifact, especially when using
+`--force` deliberately.
+
+It validates the signed DGP cache, polls the atomically written ALFD
+checkpoint, saves a local progress PNG and long-format CSV under
+`352515/adaptive/`, and uploads the same overlay after every completed beta.
+The protected
+`bounds_confidence` curve is shown as the primary EMW upper; the paper-style
+point estimate is dashed. A crossing of the finite-sample `power_cp1` curve is
+highlighted as a diagnostic warning, not treated as an automatic stopping
+rule, because the finite-sample estimated-covariance simulation and the
+known-covariance limit experiment are not identical. The same-experiment
+benchmark lower confidence endpoint is also plotted and is the formal
+implementation check.
+
+To test only the W&B plumbing in a few seconds, without a DGP cache or any
+matrix-hypergeometric work, run:
+
+```bash
+python3 watch_power_progress.py \
+  --version 352515 \
+  --demo \
+  --wandb-project subvector-ar-hw \
+  --wandb-mode online
+```
+
+The demo is visibly marked synthetic, gets a separate `emw-demo-*` run ID,
+and writes only below `352515/adaptive/demo/`. It is not a power calculation.
 
 
 ## Inputs and configurable knobs
