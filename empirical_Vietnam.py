@@ -1571,13 +1571,21 @@ def make_diagnostic_plot(
     output_path: Path,
     show_two_sls_estimate: bool = True,
     use_gkm_paper_style: bool = False,
+    monochrome: bool = False,
 ) -> None:
     """Plot AR, GKM CV, and HW CV with both confidence-interval boundaries."""
 
     if row.conditional_hw is None:  # pragma: no cover - workflow guard
         raise ReplicationError("Cannot plot before CHW is available")
     figure, axis = plt.subplots(figsize=(9.2, 5.8))
-    if use_gkm_paper_style:
+    if monochrome:
+        ar_color = "black"
+        gkm_color = "black"
+        hw_color = "black"
+        unconditional_color = "black"
+        gkm_endpoint_style = "--"
+        hw_endpoint_style = "-."
+    elif use_gkm_paper_style:
         ar_color = "#ef4444"
         gkm_color = "#c05ac8"
         hw_color = "#2563eb"
@@ -2323,6 +2331,7 @@ def main() -> None:
                     plot_path,
                     show_two_sls_estimate=variable not in {"gender", "south"},
                     use_gkm_paper_style=variable == "south",
+                    monochrome=variable == "south",
                 )
 
             max_estimate_diff = max(
