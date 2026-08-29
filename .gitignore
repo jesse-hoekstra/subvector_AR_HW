@@ -10,6 +10,8 @@ venv/
 docs/*
 !docs/ALFD_power_bound_method.md
 research_papers
+data/
+results/
 
 
 # Compiled mhg shared library (rebuild with koev/mhg15/build.sh)
