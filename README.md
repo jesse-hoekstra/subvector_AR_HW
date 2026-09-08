@@ -93,6 +93,51 @@ See `docs/ALFD_power_bound_method.md` for the exact algorithm, meanings of
 $\widetilde\pi$, $\bar\pi$, and $\epsilon$, paper-scale budgets, runtime
 accounting, and the limitation of a finite grid when $m_W=3$.
 
+### Add midpoints to a completed bound curve
+
+For an existing nine-point curve, `refine_power_curve.py` adds the eight
+midpoints and saves a merged 17-point result. Copy this additional script to
+the server alongside the existing scripts, and use the original Python
+environment. It inherits the original simulation settings, loads and verifies
+the existing `pooled_gkm_*.npz` bank, and copies all previously calculated
+per-beta results unchanged. Missing or incompatible banks cause an error;
+the refinement driver has no bank-building path. Keep `alfd_eigval.py` and
+the MHG library unchanged because their hashes identify the cached bank.
+
+```bash
+python3 refine_power_curve.py --version 352515 --beta-count 17 \
+  --workers 48 --preflight-only
+python3 refine_power_curve.py --version 352515 --beta-count 17 \
+  --workers 48 --acknowledge-expensive
+```
+
+The new beta values are `[-1.75, -1.25, -0.75, -0.25, 0.25, 0.75, 1.25, 1.75]`.
+Outputs are separate from the original run, under `352515/gkm_direct/refined/`:
+`gkm_eigval_352515.npz` contains the complete merged result, and
+`gkm_bounds_352515.csv` contains beta, bound, and Monte Carlo standard error.
+A partial NPZ and CSV are updated after each completed midpoint. Rerunning
+the same command resumes only missing midpoints; a completed refinement is
+a no-op. Refinement provenance records the original file hash and distinct,
+deterministic seeds for the added beta values.
+
+After completion, render the denser curve with the existing DGP overlay:
+
+```bash
+python3 watch_power_progress.py --version 352515 --once \
+  --partial-path 352515/gkm_direct/refined/gkm_eigval_352515.partial.npz \
+  --final-path 352515/gkm_direct/refined/gkm_eigval_352515.npz \
+  --output 352515/gkm_direct/refined/live_power_progress_352515.png
+```
+
+For live monitoring, omit `--once`; the existing W&B options also work. The
+plot and completed count include both original and added points. The existing
+watcher's `latest_beta` scalar stays at 2 because it selects the largest
+completed beta, which is already present in the original result.
+
+Bank reuse avoids the initial null-density computation. Each new beta still
+requires fitting and density evaluations on fresh alternative draws, so the
+refinement remains a substantial calculation.
+
 ### Follow a long bound run live
 
 The W&B integration is deliberately a separate read-only watcher. This keeps
