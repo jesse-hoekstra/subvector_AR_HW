@@ -1,5 +1,5 @@
 """
-Eigenvalue-density-based ALFD power bound for m_W = 3 (p = 4).
+Eigenvalue-density-based ALFD power bound for m_W = 2 or 3 (p = m_W + 1).
 
 Uses the noncentral-Wishart joint density of (real) ordered eigenvalues of a
 noncentral Wishart matrix. The matrix hypergeometric 0F1^(2)((1/2)k; (1/4)Ω, S)
@@ -9,7 +9,7 @@ Octave required.
 
 The calculation bounds tests measurable with respect to the ordered eigenvalue
 vector (the invariant class studied in the reference application).  It is a
-direct m_W=3 extension of the GKM Supplement D.3.2 implementation of EMW:
+direct higher-dimensional extension of GKM Supplement D.3.2 / EMW:
 one pooled ordinary-importance-sampling null bank, the fixed EMW weight update,
 the Step-6 mixture calibration, and the Step-8/9 grid adjustment.  Numerical
 matrix-hypergeometric truncation remains adaptive for every density pair.
@@ -43,7 +43,7 @@ from scipy.special import logsumexp
 
 
 # ============================================================
-# Allowed kappa configurations (m_W = 3)
+# Allowed kappa configurations (m_W = 2 or 3)
 # Each provides a *starting* 0F1 order.  Every density evaluation now checks
 # its coefficient tail and increases the order locally when needed, so this is
 # no longer a numerical result that users have to tune by rerunning a curve.
@@ -58,6 +58,10 @@ POOLED_IS_METHOD = "gkm_stratified_equal_null_mixture_v1"
 GRID_DESIGN_BETA_COUNT = 81
 
 ALLOWED_CONFIGS = {
+    (100, 15): dict(
+        M_start=20,
+        standard=[(100.0, 15.0)],
+    ),
     (35, 25, 15): dict(
         M_start=20,
         standard=[(35.0, 25.0, 15.0), (50.0, 25.0, 5.0),
@@ -78,6 +82,7 @@ ALLOWED_CONFIGS = {
 # Version labels selectable on the command line (python alfd_eigval.py --version <label>).
 # Each maps to a key in ALLOWED_CONFIGS.
 VERSION_LABELS = {
+    "10015": (100, 15),
     "352515": (35, 25, 15),
     "1003015": (100, 30, 15),
     "1009590": (100, 95, 90),
@@ -116,8 +121,10 @@ def log_sum_exp(x, axis=0):
     return np.squeeze(x_max, axis=axis) + np.log(np.sum(np.exp(x - x_max), axis=axis))
 
 
-def _dgp_constants(k, n):
-    """Fixed pieces of the HW Appendix A.3 DGP (m_W = 3)."""
+def _dgp_constants(k, n, m_W=3):
+    """Appendix A.3 design, retaining the first two W coordinates for m_W=2."""
+    if k != 7 or m_W not in (2, 3):
+        raise ValueError("the configured DGP requires k=7 and m_W in (2, 3)")
     Sigma = np.array([
         [1.0, 0.1, 0.3, 0.2, 0.8],
         [0.1, 1.0, 0.3, 0.2, 0.1],
@@ -136,7 +143,8 @@ def _dgp_constants(k, n):
     ])
     pi_x = (4.0 / np.sqrt(k * n)) * np.array([1, 1, 1, -1, 1, 1, 1])
     gamma_params = np.array([-1.0, 1.0, 1.0])
-    return Sigma, A, pi_x, gamma_params
+    return (Sigma[:m_W + 2, :m_W + 2], A[:, :m_W], pi_x,
+            gamma_params[:m_W])
 
 
 def asymptotic_ncp_eigenvalues(beta, kappas, k, n):
@@ -149,7 +157,7 @@ def asymptotic_ncp_eigenvalues(beta, kappas, k, n):
     those of Sigma_uu^{-1/2'} (n Pi*' Pi*) Sigma_uu^{-1/2}.
     """
     m_W = len(kappas)
-    Sigma, A, pi_x, gamma_params = _dgp_constants(k, n)
+    Sigma, A, pi_x, gamma_params = _dgp_constants(k, n, m_W)
 
     Sigma_eps_eps = Sigma[0, 0]
     Sigma_eps_Vw = Sigma[0, 2:]
@@ -162,7 +170,7 @@ def asymptotic_ncp_eigenvalues(beta, kappas, k, n):
     pi_y0 = beta * pi_x + Pi_W @ gamma_params
     Pi_star = np.column_stack([pi_y0, Pi_W])
 
-    sel = np.zeros(5)
+    sel = np.zeros(m_W + 2)
     sel[0] = 1.0
     sel[1] = beta
     sel[2:] = gamma_params
@@ -271,6 +279,7 @@ MHG_LARGE_TRACE_THRESHOLD = 120.0
 MHG_LARGE_TRACE_MARGIN = 60.0
 MHG_BENCHMARK_SEED = 0x454D57
 MHG_DEFAULT_BENCHMARK_SAMPLES = {
+    (100, 15): 64,
     (35, 25, 15): 64,
     (100, 30, 15): 16,
     (100, 95, 90): 2,
@@ -611,12 +620,13 @@ def chunked_mhg_batch(c, Omegas, S_batch, M_trunc=20,
     diagnostics = dict(pairs=0, raw_evaluations=0, order_counts=Counter(),
                        max_order=0, max_remainder_ratio=0.0)
 
-    # When running in parallel, size chunks so there are ~4x as many chunks as
-    # workers -- otherwise (e.g. fixed chunk_size=100 with only ~1350 samples)
-    # only a handful of chunks exist and most cores sit idle. This matters most
-    # at large adaptively selected orders, where one density pair can take seconds.
+    n_workers = _validated_integer("n_workers", n_workers)
+    chunk_size = _validated_integer("chunk_size", chunk_size)
+    # Keep at least ~4 tasks per worker for small batches, but never enlarge
+    # the requested chunks for a large bank. Adaptive costs vary greatly by
+    # stratum; small tasks let idle workers pick up remaining expensive draws.
     if n_workers > 1:
-        chunk_size = max(1, N // (4 * n_workers))
+        chunk_size = min(chunk_size, max(1, N // (4 * n_workers)))
 
     chunk_bounds = [(i * chunk_size, min((i + 1) * chunk_size, N))
                     for i in range((N + chunk_size - 1) // chunk_size)]
@@ -653,6 +663,9 @@ def chunked_mhg_batch(c, Omegas, S_batch, M_trunc=20,
                      for ci, (i0, i1) in enumerate(chunk_bounds)]
         completed_calls = 0
         completed_chunks = 0
+        print(f"      [{progress_label}] dispatching {n_chunks:,} chunks "
+              f"(up to {chunk_size} samples each) to {n_workers} workers; "
+              f"{total_calls:,} density pairs", flush=True)
         with Pool(processes=n_workers) as pool:
             for chunk_id, chunk_result, chunk_diag in pool.imap_unordered(
                     _mhg_chunk_worker, args_list):
@@ -909,6 +922,76 @@ def common_null_grid_3d(alt_nuisance_rows, config_kappas, standard_points=None,
     return grid
 
 
+def common_null_grid_2d(alt_nuisance_rows, config_kappas, standard_points=None,
+                        n_shapes=5, n_strengths=7, max_strength=100.0):
+    """Common null grid for two ordered nuisance eigenvalues.
+
+    Each ray is ``strength * (1, ratio)``. The configuration, rank-one and
+    equal-eigenvalue boundaries, and the extreme alternative-path ratios are
+    followed by fixed interior ratios if needed. Defaults give 36 rows,
+    including the origin, for the (100, 15) configuration. The exact configuration and any
+    explicitly supplied anchors are retained even when off the strength grid.
+    """
+    n_shapes = _validated_integer("n_shapes", n_shapes)
+    n_strengths = _validated_integer("n_strengths", n_strengths)
+    if not np.isfinite(max_strength) or max_strength <= 0.1:
+        raise ValueError("max_strength must be finite and greater than 0.1")
+    config = np.asarray(config_kappas, dtype=float)
+    alternatives = np.asarray(alt_nuisance_rows, dtype=float)
+    standards = (np.empty((0, 2), dtype=float) if standard_points is None
+                 else np.asarray(standard_points, dtype=float))
+    if (config.shape != (2,) or alternatives.ndim != 2
+            or alternatives.shape[1] != 2 or standards.ndim != 2
+            or standards.shape[1] != 2):
+        raise ValueError("common_null_grid_2d requires two-dimensional rows")
+    if (not np.all(np.isfinite(config))
+            or not np.all(np.isfinite(alternatives))
+            or not np.all(np.isfinite(standards))
+            or np.any(config < 0.0) or np.any(alternatives < 0.0)
+            or np.any(standards < 0.0) or config[0] <= 0.0
+            or np.any(np.diff(config) > 1e-10)
+            or np.any(np.diff(alternatives, axis=1) > 1e-10)
+            or np.any(np.diff(standards, axis=1) > 1e-10)):
+        raise ValueError("grid inputs must be finite, nonnegative and descending")
+
+    nonzero_alternatives = alternatives[alternatives[:, 0] > 0.0]
+    ratios = [float(config[1] / config[0]), 0.0, 1.0]
+    if len(nonzero_alternatives):
+        path_ratios = nonzero_alternatives[:, 1] / nonzero_alternatives[:, 0]
+        ratios.extend([float(path_ratios.min()), float(path_ratios.max())])
+    ratios.extend(float(row[1] / row[0]) for row in standards if row[0] > 0.0)
+    ratios.extend([0.25, 0.5, 0.75, 0.1, 0.9, 0.05])
+    shapes, seen = [], set()
+    for ratio in ratios:
+        key = round(ratio, 12)
+        if key not in seen:
+            seen.add(key)
+            shapes.append((1.0, ratio))
+        if len(shapes) == n_shapes:
+            break
+    index = 1
+    while len(shapes) < n_shapes:
+        ratio = (index * 0.6180339887498949) % 1.0
+        key = round(ratio, 12)
+        if key not in seen:
+            seen.add(key)
+            shapes.append((1.0, ratio))
+        index += 1
+
+    strengths = np.geomspace(0.1, float(max_strength), n_strengths)
+    grid = [(0.0, 0.0)]
+    grid.extend((float(strength), float(strength * ratio))
+                for _, ratio in shapes for strength in strengths)
+    grid_keys = {tuple(round(x, 12) for x in row) for row in grid}
+    for row in [config, *standards]:
+        anchor = tuple(float(x) for x in row)
+        key = tuple(round(x, 12) for x in anchor)
+        if key not in grid_keys:
+            grid_keys.add(key)
+            grid.append(anchor)
+    return grid
+
+
 # ============================================================
 # EMW/GKM calibration primitives
 # ============================================================
@@ -1079,7 +1162,7 @@ def _validate_pooled_is_bank(bank):
             or not np.all(np.isfinite(log_q)) or not np.all(np.isfinite(base))
             or np.any(base <= 0.0) or not np.isclose(base.sum(), 1.0,
                                                      atol=1e-12)
-            or grid.ndim != 2 or eigs.ndim != 2
+            or grid.ndim != 2 or eigs.ndim != 2 or grid.shape[1] < 1
             or eigs.shape[1] != grid.shape[1] + 1
             or np.any(grid < 0.0) or np.any(np.diff(grid, axis=1) > 1e-10)
             or np.any(eigs < -1e-10) or np.any(np.diff(eigs, axis=1) > 1e-8)
@@ -1340,16 +1423,41 @@ def _pooled_bank_settings(grid, role, k_eff, n_per_stratum, seed,
     return settings
 
 
+def _sample_pooled_null_eigenvalues(grid, k_eff, n_per_stratum, seed):
+    """Canonical bank draws, shared by local and multi-node builders."""
+    H = len(grid)
+    p = len(grid[0]) + 1
+    rng = np.random.default_rng(seed)
+    eigs = np.empty((H * n_per_stratum, p))
+    for j, row in enumerate(grid):
+        start = j * n_per_stratum
+        stop = start + n_per_stratum
+        M_null = build_M(list(row) + [0.0], k_eff)
+        eigs[start:stop] = eigenvalues_descending(
+            simulate_Xi(M_null, n_per_stratum, rng))
+    return eigs
+
+
 def build_or_load_pooled_is_bank(grid, k_eff, n_per_stratum, seed,
                                  M_start=20, M_step=MHG_DEFAULT_STEP,
                                  M_max=MHG_DEFAULT_MAX, mhg_tol=MHG_CONV_TOL,
                                  n_workers=1, role="gkm",
                                  cache_dir=None, cache_metadata=None):
     """Build/cache one beta-invariant GKM stratified null bank."""
-    grid = _validated_null_grid(grid, 3, "common pooled null grid")
+    try:
+        grid_array = np.asarray(grid, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("common pooled null grid must be a rectangular matrix") from exc
+    if grid_array.ndim != 2 or grid_array.shape[1] < 1:
+        raise ValueError("common pooled null grid must have at least one nuisance column")
+    dimension = grid_array.shape[1]
+    grid = _validated_null_grid(grid_array, dimension, "common pooled null grid")
     n_per_stratum = _validated_integer(
         "n_per_stratum", n_per_stratum, minimum=2)
     k_eff = _validated_integer("k_eff", k_eff)
+    p = dimension + 1
+    if k_eff < p:
+        raise ValueError(f"require k_eff >= p={p} for the pooled null bank")
     if role != "gkm":
         raise ValueError("direct calculation requires pooled bank role 'gkm'")
     settings = _pooled_bank_settings(
@@ -1427,23 +1535,37 @@ def build_or_load_pooled_is_bank(grid, k_eff, n_per_stratum, seed,
                 f"Cannot trust pooled-bank cache {cache_path}: {exc}. "
                 "Move the damaged cache aside and rerun.") from exc
 
-    H = len(grid)
-    p = 4
-    rng = np.random.default_rng(seed)
-    eigs = np.empty((H * n_per_stratum, p))
-    strata = np.repeat(np.arange(H, dtype=int), n_per_stratum)
-    for j, row in enumerate(grid):
-        start = j * n_per_stratum
-        stop = start + n_per_stratum
-        M_null = build_M(list(row) + [0.0], k_eff)
-        eigs[start:stop] = eigenvalues_descending(
-            simulate_Xi(M_null, n_per_stratum, rng))
+    eigs = _sample_pooled_null_eigenvalues(grid, k_eff, n_per_stratum, seed)
     omegas = np.asarray([list(row) + [0.0] for row in grid], dtype=float)
     log_f, diagnostics = log_eigval_density_partial(
         eigs, omegas, k_eff / 2.0, M_trunc=M_start, chunk_size=100,
         progress_label=f"common-{role}-null", n_workers=n_workers,
         M_step=M_step, M_max=M_max, mhg_tol=mhg_tol,
         return_diagnostics=True)
+    return _finalize_pooled_is_bank(
+        settings, eigs, log_f, diagnostics, cache_dir=cache_dir)
+
+
+def _finalize_pooled_is_bank(settings, eigs, log_f, diagnostics, cache_dir=None):
+    """Validate and save a complete bank assembled locally or from shards."""
+    grid = np.asarray(settings["grid"], dtype=float)
+    eigs = np.asarray(eigs, dtype=float)
+    log_f = np.asarray(log_f, dtype=float)
+    H = len(grid)
+    n_per_stratum = _validated_integer(
+        "n_per_stratum", settings["n_per_stratum"], minimum=2)
+    k_eff = _validated_integer("k_eff", settings["k_eff"])
+    seed = _validated_integer("seed", settings["seed"], minimum=0)
+    role = settings["role"]
+    if (grid.ndim != 2 or H == 0
+            or eigs.shape != (H * n_per_stratum, grid.shape[1] + 1)
+            or log_f.shape != (H, H * n_per_stratum)):
+        raise ValueError("assembled pooled bank has incompatible array shapes")
+    canonical = json.dumps(settings, sort_keys=True, separators=(",", ":"))
+    bank_id = hashlib.sha256(canonical.encode()).hexdigest()
+    cache_path = (None if cache_dir is None else os.path.join(
+        cache_dir, f"pooled_{role}_{bank_id[:16]}.npz"))
+    strata = np.repeat(np.arange(H, dtype=int), n_per_stratum)
     log_q = logsumexp(log_f - math.log(H), axis=0)
     base = np.full(H * n_per_stratum, 1.0 / (H * n_per_stratum))
     diagnostics_json = _canonical_pooled_mhg_diagnostics(
@@ -1460,7 +1582,7 @@ def build_or_load_pooled_is_bank(grid, k_eff, n_per_stratum, seed,
         k_eff=k_eff,
         experiment_signature=settings["experiment_signature"],
         settings_json=canonical, content_signature=content_signature)
-    _validate_pooled_is_bank(bank)
+    _authenticated_pooled_bank_settings(bank)
     if cache_path is not None:
         os.makedirs(cache_dir, exist_ok=True)
         _atomic_savez(
@@ -1627,7 +1749,7 @@ def gkm_eigval_bound_from_pooled_bank(
         n_iter=600, seed=42, verbose=True, n_workers=1,
         M_trunc=20, M_step=MHG_DEFAULT_STEP,
         M_max=MHG_DEFAULT_MAX, mhg_tol=MHG_CONV_TOL):
-    """Direct m_W=3 implementation of GKM Supplement D.3.2 Steps 3--9.
+    """Dimension-generic implementation of GKM Supplement D.3.2 Steps 3--9.
 
     The supplied bank is GKM's single Step-1/2 pooled ``N0`` experiment and
     is reused for fitting, Step-6 mixture calibration, and Step-8 grid
@@ -1663,13 +1785,13 @@ def gkm_eigval_bound_from_pooled_bank(
             "call-time adaptive-M settings differ from pooled-bank settings")
 
     kappas_alt = np.asarray(kappas_alt, dtype=float)
-    p = kappas_alt.size
-    if (p != 4 or not np.all(np.isfinite(kappas_alt))
+    p = np.asarray(bank.grid).shape[1] + 1
+    if (kappas_alt.shape != (p,) or not np.all(np.isfinite(kappas_alt))
             or np.any(kappas_alt < 0.0)
             or np.any(np.diff(kappas_alt) > 1e-10)):
-        raise ValueError("direct GKM p=4 alternative eigenvalues are invalid")
+        raise ValueError(f"direct GKM p={p} alternative eigenvalues are invalid")
     if k_eff < p or not (0.0 < alpha < 1.0):
-        raise ValueError("require k_eff >= 4 and 0 < alpha < 1")
+        raise ValueError(f"require k_eff >= p={p} and 0 < alpha < 1")
 
     omega_alt = kappas_alt[None, :]
     phase_diagnostics = {}
@@ -1839,7 +1961,7 @@ def _gkm_budget_diagnostics(alpha, common_grid_size, n_nonnull, budget):
     if not (0.0 < alpha < 1.0):
         raise ValueError("alpha must lie in (0,1)")
     H = _validated_integer("common_grid_size", common_grid_size)
-    B = _validated_integer("n_nonnull", n_nonnull)
+    B = _validated_integer("n_nonnull", n_nonnull, minimum=0)
     n0 = _validated_integer("n_fit", budget["n_fit"], minimum=2)
     n1 = _validated_integer("n_power", budget["n_power"], minimum=2)
     n_iter = _validated_integer("n_iter", budget["n_iter"])
@@ -1863,11 +1985,12 @@ def _print_gkm_budget_diagnostics(result, alpha):
     print(f"  common null grid H={result['common_grid_size']}; "
           f"N0=n_fit={result['n_fit']:,} per null "
           f"({result['pooled_observations']:,} pooled observations)")
-    print(f"  Step 5 uses mu0=-2, omega=2, and exactly "
-          f"O=n_iter={result['n_iter']} cached-table updates")
-    print(f"  N1=n_power={result['n_power']:,} fresh alternative draws per "
-          f"non-null beta; largest Bernoulli MC SE is about "
-          f"{100 * result['power_se_at_half']:.3f} pp")
+    if result["n_nonnull"]:
+        print(f"  Step 5 uses mu0=-2, omega=2, and exactly "
+              f"O=n_iter={result['n_iter']} cached-table updates")
+        print(f"  N1=n_power={result['n_power']:,} fresh alternative draws per "
+              f"non-null beta; largest Bernoulli MC SE is about "
+              f"{100 * result['power_se_at_half']:.3f} pp")
     print(f"  nominal direct-null tail SE reference at alpha={alpha:g} is "
           f"{100 * result['null_tail_se_reference']:.3f} pp; actual ordinary-"
           "IS precision depends on the saved mass and ESS diagnostics")
@@ -1886,8 +2009,9 @@ def _print_gkm_budget_diagnostics(result, alpha):
 def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
                             M_start, M_step, M_max, mhg_tol, n_workers,
                             n_samples, fit_grids,
-                            benchmark_seed=MHG_BENCHMARK_SEED):
-    """Time a small deterministic batch of representative real p=4 pairs.
+                            benchmark_seed=MHG_BENCHMARK_SEED,
+                            null_bank_only=False):
+    """Time a small deterministic batch of representative real density pairs.
 
     The benchmark owns its ``Generator`` and exits before a production run is
     initialized, so it neither consumes production random draws nor writes an
@@ -1896,7 +2020,9 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
     alternative.  This approximates the fresh production pair mix and exposes
     costly boundary/stress draws that the former alternative-only benchmark
     missed.  Every observation is evaluated against every fitted-null density
-    plus the alternative, matching production row batching.  Alternative trace
+    plus the alternative, matching production row batching. ``null_bank_only``
+    instead samples only null draws and evaluates only common null rows.
+    Alternative trace
     quantiles from a larger candidate pool reduce small-batch noise.
     """
     n_samples = _validated_integer("benchmark_samples", n_samples)
@@ -1911,11 +2037,15 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
     betas = np.asarray(betas, dtype=float)
     ncp_table = np.asarray(ncp_table, dtype=float)
     if (betas.ndim != 1 or ncp_table.ndim != 2
-            or ncp_table.shape != (betas.size, 4)
+            or ncp_table.shape[0] != betas.size or ncp_table.shape[1] < 2
             or not np.all(np.isfinite(betas))
             or not np.all(np.isfinite(ncp_table))
-            or np.any(ncp_table < 0.0)):
-        raise ValueError("benchmark requires aligned finite nonnegative p=4 NCPs")
+            or np.any(ncp_table < 0.0)
+            or np.any(np.diff(ncp_table, axis=1) > 1e-10)):
+        raise ValueError("benchmark requires aligned finite nonnegative descending NCPs")
+    p = ncp_table.shape[1]
+    if k_eff < p:
+        raise ValueError(f"require k_eff >= p={p} for the benchmark")
     nonnull_indices = np.flatnonzero(betas != 0.0)
     if nonnull_indices.size == 0:
         raise ValueError("benchmark beta grid has no non-null alternative")
@@ -1928,20 +2058,22 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
     if len(fit_grids) != betas.size:
         raise ValueError("fit_grids must align with the benchmark beta grid")
     fit_grid = _validated_null_grid(
-        fit_grids[representative_index], 3,
+        fit_grids[representative_index], p - 1,
         "benchmark fit null grid")
-    benchmark_omegas = np.vstack([
-        np.asarray([list(row) + [0.0] for row in fit_grid], dtype=float),
-        representative_omega[None],
-    ])
-    benchmark_scope = "all_fitted_null_rows_plus_alternative"
+    benchmark_omegas = np.asarray(
+        [list(row) + [0.0] for row in fit_grid], dtype=float)
+    benchmark_scope = "all_fitted_null_rows"
+    if not null_bank_only:
+        benchmark_omegas = np.vstack([
+            benchmark_omegas, representative_omega[None]])
+        benchmark_scope = "all_fitted_null_rows_plus_alternative"
 
     # This generator is deliberately unrelated to all four production phase
     # SeedSequences.  The constant seed makes target-machine comparisons
     # repeatable even when the requested production seed changes.
     rng = np.random.default_rng(int(benchmark_seed))
-    n_null_samples = min(
-        n_samples, max(1, int(round(2.0 * n_samples / 3.0))))
+    n_null_samples = (n_samples if null_bank_only else min(
+        n_samples, max(1, int(round(2.0 * n_samples / 3.0)))))
     n_alt_samples = n_samples - n_null_samples
     grid_locations = np.rint(np.linspace(
         0, len(fit_grid) - 1, n_null_samples)).astype(int)
@@ -1998,7 +2130,7 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
         null_samples=int(n_null_samples),
         alternative_samples=int(n_alt_samples),
         omega_rows=int(len(benchmark_omegas)),
-        fit_null_rows=int(len(benchmark_omegas) - 1),
+        fit_null_rows=int(len(fit_grid)),
         sample_trace_min=float(np.min(samples.sum(axis=1))),
         sample_trace_max=float(np.max(samples.sum(axis=1))),
         samples=int(n_samples), pairs=int(benchmark_pairs),
@@ -2016,7 +2148,9 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
 
 
 def _print_mhg_benchmark(result):
-    print("Target-machine adaptive p=4 benchmark:")
+    p = len(result["representative_omega"])
+    alternative_rows = result["omega_rows"] - result["fit_null_rows"]
+    print(f"Target-machine adaptive p={p} benchmark:")
     print(f"  machine: {result['machine']}; processor: "
           f"{result['processor']}; logical CPUs: "
           f"{result['logical_cpu_count']}")
@@ -2028,7 +2162,7 @@ def _print_mhg_benchmark(result):
     print(f"  sample mix: {result['null_samples']} common-grid null + "
           f"{result['alternative_samples']} representative alternative")
     print(f"  density-row scope: {result['benchmark_scope']} "
-          f"({result['fit_null_rows']} fitted null + 1 alternative)")
+          f"({result['fit_null_rows']} fitted null + {alternative_rows} alternative)")
     print(f"  {result['samples']} samples x {result['omega_rows']} Omega rows = "
           f"{result['pairs']} density pairs on {result['workers']} worker(s) "
           f"in {result['elapsed_seconds']:.2f} s: "
@@ -2057,14 +2191,34 @@ def _print_mhg_benchmark(result):
 
 
 
+def _gkm_provenance(m_W):
+    """Shared scientific-code identity for local and multi-node null banks."""
+    source_path = os.path.abspath(__file__)
+    lib_name = "libmhg.dylib" if sys.platform == "darwin" else "libmhg.so"
+    return dict(
+        schema_version=RESULT_SCHEMA_VERSION,
+        algorithm=("gkm_eigval_mw2_adaptive_v4" if m_W == 2
+                   else ALGORITHM_VERSION),
+        producer=os.path.basename(source_path),
+        calibration_method=CALIBRATION_METHOD,
+        source_sha256=_sha256_file(source_path),
+        mhg_core_sha256=_sha256_file(os.path.join(MHG_DIR, "mhg_core.c")),
+        mhg_library_sha256=_sha256_file(os.path.join(MHG_DIR, lib_name)),
+        mhg_build_source_sha256=_verify_mhg_build_provenance(
+            MHG_DIR, lib_name),
+        python_version=sys.version,
+        numpy_version=np.__version__, scipy_version=scipy.__version__,
+        platform=platform.platform())
+
+
 def main():
-    """Run the direct m_W=3 extension of GKM Supplement D.3.2."""
+    """Build the common null bank, optionally continuing to the GKM curve."""
     import argparse
 
     parser = argparse.ArgumentParser(
         description=(
             "Direct GKM D.3.2 / EMW eigenvalue power-bound calculation for "
-            "m_W=3, with per-density adaptive 0F1 truncation."))
+            "m_W=2 or 3, with per-density adaptive 0F1 truncation."))
     parser.add_argument(
         "--version", required=True, choices=list(VERSION_LABELS),
         help="configuration label (" + ", ".join(VERSION_LABELS) + ")")
@@ -2076,18 +2230,23 @@ def main():
     parser.add_argument(
         "--force", action="store_true",
         help="replace an incompatible completed direct-GKM artifact")
+    parser.add_argument(
+        "--null-bank-only", action="store_true",
+        help="build/load the reusable pooled null bank and exit before power fitting")
     preflight = parser.add_mutually_exclusive_group()
     preflight.add_argument(
         "--preflight-only", action="store_true",
         help="print exact direct-GKM density-pair counts and exit")
     preflight.add_argument(
         "--benchmark-preflight", action="store_true",
-        help="benchmark a representative adaptive p=4 density batch and exit")
+        help="benchmark a representative adaptive density batch and exit")
     parser.add_argument("--benchmark-samples", type=int, default=None)
     parser.add_argument(
         "--acknowledge-expensive", action="store_true",
         help="required before starting a production/reference calculation")
-    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="worker processes for density evaluations (default: min(CPUs, 16))")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--m-start", type=int, default=None,
                         help="minimum 0F1 degree; each density pair adapts upward")
@@ -2104,8 +2263,8 @@ def main():
         "--n-iter", type=int, default=None,
         help="GKM O fixed weight updates (paper value: 600)")
     parser.add_argument(
-        "--grid-shapes", type=int, default=9,
-        help="common three-dimensional nuisance-shape directions")
+        "--grid-shapes", type=int, default=None,
+        help="common nuisance-shape directions (default: 5 for m_W=2, 9 for m_W=3)")
     parser.add_argument(
         "--grid-strengths", type=int, default=7,
         help="log-spaced strengths per direction")
@@ -2122,6 +2281,8 @@ def main():
     key = VERSION_LABELS[args.version]
     cfg = ALLOWED_CONFIGS[key]
     kappas = np.asarray(key, dtype=float)
+    if args.grid_shapes is None:
+        args.grid_shapes = 5 if len(kappas) == 2 else 9
     standard_points = cfg["standard"]
     M_start = cfg["M_start"] if args.m_start is None else args.m_start
     profiles = {
@@ -2183,7 +2344,9 @@ def main():
         np.maximum(
             asymptotic_ncp_eigenvalues(b, kappas, k, n), 0.0)[:-1]
         for b in grid_design_betas])
-    common_grid = common_null_grid_3d(
+    grid_builder = common_null_grid_2d if len(kappas) == 2 else common_null_grid_3d
+    grid_method = "strength_shape_2d_v1" if len(kappas) == 2 else COMMON_GRID_METHOD
+    common_grid = grid_builder(
         grid_design_nuisance, kappas, standard_points=standard_points,
         n_shapes=args.grid_shapes, n_strengths=args.grid_strengths,
         max_strength=args.grid_max_strength)
@@ -2191,30 +2354,38 @@ def main():
     grid_anchor_count = H - (1 + args.grid_shapes * args.grid_strengths)
     if not (0 <= grid_anchor_count <= len(standard_points)):
         raise AssertionError("unexpected common-grid anchor count")
-    B = int(np.count_nonzero(nonnull))
+    B = 0 if args.null_bank_only else int(np.count_nonzero(nonnull))
     try:
         budget_diagnostics = _gkm_budget_diagnostics(
             alpha, H, B, budget)
     except ValueError as exc:
         parser.error(f"invalid direct-GKM simulation budget: {exc}")
     total_logical_pairs = budget_diagnostics["total_pairs"]
+    print(f"Version {args.version}: m_W={len(kappas)}, p={len(kappas) + 1}, "
+          f"kappas={kappas.tolist()}, k={k}, n={n}; workers={n_workers}")
+    if args.null_bank_only:
+        print("Null-bank-only mode: build/cache Step 1/2; no beta power calculation.")
     _print_gkm_budget_diagnostics(budget_diagnostics, alpha)
 
     representative_pair_seconds = {
         (35, 25, 15): 0.123,
         (100, 30, 15): 0.827,
         (100, 95, 90): 31.1,
-    }[key]
-    serial_estimate = total_logical_pairs * representative_pair_seconds
-    parallel_lower = serial_estimate / n_workers
+    }.get(key)
     print("Preflight computational scale:")
     print(f"  logical density pairs: {total_logical_pairs:,} over {B} "
           "non-null betas")
-    print(f"  prior developer-machine representative pair: "
-          f"~{representative_pair_seconds:g} s; indicative serial "
-          f"extrapolation: {_format_duration(serial_estimate)}")
-    print(f"  optimistic perfect-{n_workers}-way lower bound: "
-          f"{_format_duration(parallel_lower)}")
+    if representative_pair_seconds is None:
+        print("  No measured timing is available for this configuration; "
+              "run --benchmark-preflight on the target machine.")
+    else:
+        serial_estimate = total_logical_pairs * representative_pair_seconds
+        parallel_lower = serial_estimate / n_workers
+        print(f"  prior developer-machine representative pair: "
+              f"~{representative_pair_seconds:g} s; indicative serial "
+              f"extrapolation: {_format_duration(serial_estimate)}")
+        print(f"  optimistic perfect-{n_workers}-way lower bound: "
+              f"{_format_duration(parallel_lower)}")
     if key == (100, 95, 90):
         print("  WARNING: strong-grid pairs can be materially slower than "
               "this representative extrapolation.")
@@ -2232,7 +2403,8 @@ def main():
             ncp_table, betas, total_logical_pairs, k,
             M_start, args.m_step, args.m_max, args.mhg_rtol,
             n_workers, sample_count,
-            fit_grids=[common_grid for _ in range(len(betas))])
+            fit_grids=[common_grid for _ in range(len(betas))],
+            **({"null_bank_only": True} if args.null_bank_only else {}))
         _print_mhg_benchmark(result)
         return
     if not args.acknowledge_expensive:
@@ -2244,29 +2416,37 @@ def main():
     out_npz = os.path.join(out_dir, f"gkm_eigval_{args.version}.npz")
     partial_npz = os.path.join(
         out_dir, f"gkm_eigval_{args.version}.partial.npz")
-    source_path = os.path.abspath(__file__)
-    lib_name = "libmhg.dylib" if sys.platform == "darwin" else "libmhg.so"
-    provenance = dict(
-        schema_version=RESULT_SCHEMA_VERSION,
-        algorithm=ALGORITHM_VERSION,
-        producer=os.path.basename(source_path),
-        calibration_method=CALIBRATION_METHOD,
-        source_sha256=_sha256_file(source_path),
-        mhg_core_sha256=_sha256_file(os.path.join(MHG_DIR, "mhg_core.c")),
-        mhg_library_sha256=_sha256_file(os.path.join(MHG_DIR, lib_name)),
-        mhg_build_source_sha256=_verify_mhg_build_provenance(
-            MHG_DIR, lib_name),
-        python_version=sys.version,
-        numpy_version=np.__version__, scipy_version=scipy.__version__,
-        platform=platform.platform())
+    provenance = _gkm_provenance(len(kappas))
     bank_seed = int(np.random.SeedSequence(
         [args.seed, 0x474B4D34]).generate_state(1, dtype=np.uint32)[0])
+    if args.null_bank_only:
+        os.makedirs(out_dir, exist_ok=True)
+        log_path = os.path.join(out_dir, "null_bank_run.log")
+        original_stdout, original_stderr = sys.stdout, sys.stderr
+        with open(log_path, "a", buffering=1) as log_handle:
+            try:
+                sys.stdout = _Tee(original_stdout, log_handle)
+                sys.stderr = _Tee(original_stderr, log_handle)
+                print(f"Logging to {log_path}")
+                print(f"Null bank for {args.version}: m_W={len(kappas)}, "
+                      f"H={H}, N0={budget['n_fit']:,}, workers={n_workers}")
+                verify_mhg()
+                bank = build_or_load_pooled_is_bank(
+                    common_grid, k, budget["n_fit"], bank_seed,
+                    M_start=M_start, M_step=args.m_step, M_max=args.m_max,
+                    mhg_tol=args.mhg_rtol, n_workers=n_workers, role="gkm",
+                    cache_dir=out_dir, cache_metadata=provenance)
+                print(f"Null bank ready: {os.path.join(out_dir, 'pooled_gkm_' + bank.bank_id[:16] + '.npz')}")
+                print("Finished null-bank-only run; no power artifacts written.")
+            finally:
+                sys.stdout, sys.stderr = original_stdout, original_stderr
+        return
     run_settings = dict(
         version_label=args.version, kappas=kappas.tolist(), k=k, n=n,
         alpha=alpha, profile=args.profile, seed=args.seed,
         M_start=M_start, M_step=args.m_step, M_max=args.m_max,
         mhg_rtol=args.mhg_rtol, beta_count=int(args.beta_count),
-        fit_grid_strategy=COMMON_GRID_METHOD,
+        fit_grid_strategy=grid_method,
         pooled_importance_method=POOLED_IS_METHOD,
         common_grid=common_grid,
         grid_design_beta_count=GRID_DESIGN_BETA_COUNT,
@@ -2342,7 +2522,7 @@ def main():
         diagnostics_json=diagnostics_json)
     checkpoint_metadata = dict(
         schema_version=np.array(RESULT_SCHEMA_VERSION),
-        algorithm=np.array(ALGORITHM_VERSION),
+        algorithm=np.array(provenance["algorithm"]),
         producer=np.array("alfd_eigval.py"),
         calibration_method=np.array(CALIBRATION_METHOD),
         bound_kind=np.array(BOUND_KIND),

@@ -3,7 +3,7 @@
 A small research helper accompanying the paper: "Best Feasible Conditional Critical Values for a More Powerful Subvector Anderson-Rubin Test", to simulate the joint distribution of the smallest two eigenvalues of a noncentral real Wishart matrix $W = X^\top X$ and to plot the empirical conditional CDF of the smallest eigenvalue given the second smallest eigenvalue for different $\\kappa$ configurations, where the approximation given in GKM represents the condititional cdf when the $p-2$ largest eigenvalues are $\infty$.
 
 The original conditional-CDF executable is `simulation_plot_executable.py`.
-The repository also contains a direct $m_W=3$ extension of the GKM
+The repository also contains direct $m_W=2$ and $m_W=3$ extensions of the GKM
 power-bound calculation in `alfd_eigval.py`, finite-sample comparison curves
 from `new_power_comparison.py`, and the live overlay in
 `watch_power_progress.py`.
@@ -92,6 +92,186 @@ symmetric beta points from -2 through 2, including the exact beta-zero point.
 See `docs/ALFD_power_bound_method.md` for the exact algorithm, meanings of
 $\widetilde\pi$, $\bar\pi$, and $\epsilon$, paper-scale budgets, runtime
 accounting, and the limitation of a finite grid when $m_W=3$.
+
+### Build only the null bank for m_W=2, kappa=[100,15]
+
+The `10015` preset uses `m_W=2` (`p=3`), `k=7`, `n=250`, and
+`alpha=0.05`. Its design retains the first two nuisance regressors of the
+existing Appendix A.3 implementation: the leading 4-by-4 error covariance,
+the first two columns of `A`, and `gamma=[-1,1]`; `pi_x` keeps all seven
+instrument coordinates. This is an explicit reduction of the existing design.
+
+The two-dimensional null grid contains the origin and five shape directions
+at seven log-spaced strengths from 0.1 through 100, including the exact
+`(100,15)` point and the rank-one and equal-eigenvalue boundaries. Directions
+selected from the alternative path use the fixed 81-point design path, so
+changing `--beta-count` does not change this bank. As with the three-dimensional
+calculation, this is a finite-grid approximation. The five directions retain
+the configuration ratio, both boundaries, and both extreme alternative-path
+ratios; duplicate ratios are replaced by fixed interior directions. Use
+`--grid-shapes 9` to select the denser 64-point grid for a sensitivity check.
+The existing `m_W=3` presets keep nine directions; `352515` retains 68 null points.
+
+On the compute machine, activate the Python environment and build the native
+library once if needed. The commands use the reference profile to retain the
+10,000 draws per null recorded in the previous `352515` run. Set `--workers`
+to the number of CPUs allocated to the job; the commands below use 48.
+Limit BLAS threads so each process does not
+also start its own group of numerical-library threads:
+
+```bash
+source .venv/bin/activate
+sh koev/mhg15/build.sh
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1 BLIS_NUM_THREADS=1
+
+# Inspect exact null-bank cost without simulating or writing files.
+python alfd_eigval.py --version 10015 --profile reference \
+  --null-bank-only --workers 48 --preflight-only
+
+# Measure this configuration on the target machine, without saving a bank.
+python alfd_eigval.py --version 10015 --profile reference \
+  --null-bank-only --workers 48 --benchmark-preflight --benchmark-samples 96
+
+# Build and save only the reusable null bank.
+python -u alfd_eigval.py --version 10015 --profile reference \
+  --null-bank-only --workers 48 --acknowledge-expensive
+```
+
+The reference profile uses `N0=10,000` draws per null: **36 null points,
+360,000 pooled draws, and 12,960,000 density pairs**. This is 68.4% fewer
+density evaluations than the denser 64-point grid at the same draw budget.
+The production profile uses `N0=2,000`, giving 72,000 pooled draws and
+2,592,000 pairs. The costly density evaluations run in a process pool
+with dynamically assigned sample chunks, capped at 100 samples per task.
+Draws are generated from one deterministic seed before density evaluation;
+changing the number of workers preserves the bank's draws and cache identity.
+`--workers` distributes work across CPUs on one machine.
+
+The completed bank is saved to `10015/gkm_direct/pooled_gkm_<hash>.npz`,
+with a log at `10015/gkm_direct/null_bank_run.log`. Bank-only mode performs
+no EMW weight fitting or alternative-power simulation and writes no partial
+or final power result. Rerunning the command loads a compatible completed
+bank. The bank is saved after all chunks finish; an interrupted initial build
+must restart. Use a persistent session such as `tmux` for the long run.
+
+To calculate the bound curve later, omit `--null-bank-only`:
+
+```bash
+python -u alfd_eigval.py --version 10015 --profile reference \
+  --workers 48 --beta-count 9 --acknowledge-expensive
+```
+
+This reuses the bank and saves the bound values in
+`10015/gkm_direct/gkm_eigval_10015.npz`. Keep the code, native library,
+environment, grid, seed, `--n-fit`, and adaptive-M settings unchanged between
+building and using the bank. Worker count, beta count, `--n-power`, and
+`--n-iter` do not enter the bank identity. Existing `352515` caches remain
+on disk, but the strict source-hash check means they need the original code
+revision for reuse. The separate finite-sample comparison, watcher, and
+refinement scripts still target the existing `m_W=3` workflows.
+
+### Use several SSH-accessible CPU nodes with shared storage
+
+`--workers` starts processes on the current node. To use multiple nodes without
+a scheduler, `null_bank_cluster.py` divides the bank into numbered pieces
+(shards). Each piece covers different sampled observations and evaluates all
+36 null densities for those observations. Merging restores the original
+observation order and produces the same bank format and cache identity as a
+single-node run.
+
+The example below uses four nodes and 48 local workers per node, for 192 worker
+processes in total. This is a starting point for otherwise idle nodes with
+48 physical cores each. The [Xeon Gold 6252N](https://www.intel.com/content/www/us/en/products/sku/193951/intel-xeon-gold-6252n-processor-35-75m-cache-2-30-ghz/specifications.html)
+has 24 physical cores and 48 hardware threads per processor. A node reporting
+96 logical CPUs commonly has two sockets, 24 cores per socket, and two threads
+per core; confirm these fields in `lscpu`. Logical threads are not additional
+physical cores, so 96 workers is not automatically faster than 48. Use fewer
+workers when cores are shared with other work. The best count requires sustained
+timing on the target node; the short built-in benchmark includes pool startup.
+
+Replace `/shared/path/subvector_AR_HW` with the directory visible on all nodes,
+and use the same Python environment and code on each node.
+
+**1. Prepare once, on any node.** This generates the common draws and settings;
+it does not evaluate densities.
+
+```bash
+cd /shared/path/subvector_AR_HW
+source .venv/bin/activate
+python null_bank_cluster.py prepare --version 10015 --profile reference \
+  --shards 4 --directory 10015/gkm_direct/distributed
+```
+
+At the reference budget, each of four pieces contains 90,000 observations
+and 3,240,000 density evaluations. Observations are interleaved across pieces
+so every node receives draws from every null stratum.
+
+**2. SSH into each node and start a separate tmux session.** On each node:
+
+```bash
+tmux new -s null10015
+cd /shared/path/subvector_AR_HW
+source .venv/bin/activate
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1 BLIS_NUM_THREADS=1
+```
+
+Then run the worker command below, using a different `--shard` on each node:
+
+| Node | Shard |
+|---|---:|
+| A | 0 |
+| B | 1 |
+| C | 2 |
+| D | 3 |
+
+```bash
+# Node A; replace 0 with 1, 2, or 3 on the other nodes.
+null_shard=0
+set -o pipefail
+python -u null_bank_cluster.py worker \
+  --directory 10015/gkm_direct/distributed --shard "$null_shard" --workers 48 \
+  2>&1 | tee -a "10015/gkm_direct/distributed/shard_${null_shard}.log"
+```
+
+The distributed worker itself prints to the terminal; `tee -a` also saves both
+normal output and errors to a separate log for each piece, preserving previous
+attempts. The shared folder makes these logs visible from every node. Progress
+lines show completed/total chunks and density pairs, pairs per second, elapsed
+time, and estimated time remaining. They are emitted when a chunk finishes and
+at least 15 seconds have passed since the previous update, plus at completion.
+Long-running chunks can cause a longer gap. Watch all started pieces with:
+
+```bash
+tail -n 2 -f 10015/gkm_direct/distributed/shard_*.log
+```
+
+`status` below verifies which entire pieces are complete, missing, or invalid;
+the logs provide progress within each running piece. This logging command does
+not change the code or prepared bank identity.
+
+Detach with **Ctrl-b, then d**. Reconnect by SSHing to the same node and
+running `tmux attach -t null10015`. Each node may use a different worker count.
+Completed pieces are checked and reused on rerun; an interrupted piece is
+recomputed. A lock prevents concurrent writers to the same piece. Run one
+different piece per node, rather than the full `alfd_eigval.py` bank command
+on every node, which would repeat the calculation.
+
+**3. Check completion and merge once, on any node.**
+
+```bash
+python null_bank_cluster.py status --directory 10015/gkm_direct/distributed
+python null_bank_cluster.py merge --directory 10015/gkm_direct/distributed \
+  --cache-dir 10015/gkm_direct
+```
+
+Merge rejects missing, incompatible, or damaged pieces. It saves the usual
+`10015/gkm_direct/pooled_gkm_<hash>.npz`, which the standard power command above
+loads automatically. Wait for merge to finish before starting that command.
+Keep the prepared directory until the merged bank has
+been verified. Preparing the same directory again is a no-op when the settings
+match; choose a new directory for different settings or a different shard count.
 
 ### Add midpoints to a completed bound curve
 
