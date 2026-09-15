@@ -273,6 +273,88 @@ Keep the prepared directory until the merged bank has
 been verified. Preparing the same directory again is a no-op when the settings
 match; choose a new directory for different settings or a different shard count.
 
+### Calculate the 17-point power bound on four nodes using the finished bank
+
+Copy **only `power_bound_cluster.py`** into the shared project directory. Keep
+`alfd_eigval.py`, `null_bank_cluster.py`, the native MHG library, and the Python
+environment used to build the bank unchanged. The new driver loads and checks
+an existing merged `pooled_gkm_*.npz`; it has no null-bank-building path.
+
+From the shared project directory, prepare the power run once:
+
+```bash
+source .venv/bin/activate
+python power_bound_cluster.py prepare --version 10015 --profile reference \
+  --bank-dir 10015/gkm_direct --beta-count 17 --shards 4 \
+  --directory 10015/gkm_direct/power17
+```
+
+If the bank directory contains more than one compatible bank, select the intended
+file with `--bank /path/to/pooled_gkm_<hash>.npz` instead of `--bank-dir`.
+Missing, corrupted, or incompatible banks cause an error before work starts.
+Preparation fixes the beta values `[-2, -1.75, ..., 0, ..., 1.75, 2]`, the
+bank identity, and deterministic per-beta random seeds. It records the exact
+beta-zero result (`alpha=0.05`) without a simulation, then assigns the 16
+nonzero betas as follows:
+
+| Node | `--shard` | Beta values |
+|---|---:|---|
+| A | 0 | -2, -1, 0.25, 1.25 |
+| B | 1 | -1.75, -0.75, 0.5, 1.5 |
+| C | 2 | -1.5, -0.5, 0.75, 1.75 |
+| D | 3 | -1.25, -0.25, 1, 2 |
+
+On each node, start `tmux new -s power10015` (or use a free existing session),
+enter the shared project directory, activate the environment, and run:
+
+```bash
+source .venv/bin/activate
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1 BLIS_NUM_THREADS=1
+power_shard=0  # use 1, 2, or 3 on the other nodes
+set -o pipefail
+python -u power_bound_cluster.py worker \
+  --directory 10015/gkm_direct/power17 --shard "$power_shard" --workers 48 \
+  2>&1 | tee -a "10015/gkm_direct/power17/shard_${power_shard}.log"
+```
+
+Use 48 workers only if the node has 48 physical cores available to your run;
+otherwise lower `--workers` (for example, to 16). A report of 96 logical CPUs
+alone does not establish the available physical-core count.
+
+Each node calculates four beta points sequentially, using its local workers
+for density evaluations. A separate authenticated `beta_<index>.npz` is saved
+after each point. Rerunning the same worker command verifies and skips its
+completed points; only an interrupted beta has to restart. Locks prevent
+duplicate computation of the same point. The bank is read without modification.
+
+With the 36-null reference bank (`N0=10,000`), the reference power settings use
+`N1=100,000` alternative draws and 600 EMW updates per nonzero beta. There are
+4,060,000 new density pairs per beta, or **64,960,000 across all 16 points**.
+The bank's original 12,960,000 density pairs are not recomputed. The EMW update
+stage works within each node's main process; the expensive density phases use
+the local process pool. Keep the same prepared power directory and script
+version throughout a run.
+
+Monitor from any node:
+
+```bash
+python power_bound_cluster.py status --directory 10015/gkm_direct/power17
+tail -n 2 -f 10015/gkm_direct/power17/shard_*.log
+```
+
+After all 17 results are present, merge once:
+
+```bash
+python power_bound_cluster.py merge --directory 10015/gkm_direct/power17
+```
+
+The merged result is sorted by beta and written below `10015/gkm_direct/power17/`:
+`gkm_eigval_10015.npz` holds the full scientific results and diagnostics,
+`gkm_bounds_10015.csv` contains the bound estimates and Monte Carlo standard
+errors, and `power_bound_10015.png` plots the bound curve.
+The separate existing `m_W=3` watcher and refinement scripts are not required.
+
 ### Add midpoints to a completed bound curve
 
 For an existing nine-point curve, `refine_power_curve.py` adds the eight
