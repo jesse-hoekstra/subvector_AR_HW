@@ -355,6 +355,13 @@ The merged result is sorted by beta and written below `10015/gkm_direct/power17/
 errors, and `power_bound_10015.png` plots the bound curve.
 The separate existing `m_W=3` watcher and refinement scripts are not required.
 
+### Refine the 10015 null grid to 31 shapes
+
+For a denser null-grid sensitivity run at about ten times the nine-shape bank
+workload, see [the complete 31-shape run commands](docs/run_10015_shapes31.md).
+This uses the existing scripts unchanged, retains the earlier null points,
+and saves the new bank and power results under `10015/gkm_direct/shapes31/`.
+
 ### Simulate the other power curves locally for 10015
 
 `new_power_comparison.py` now supports the same two-nuisance design as the

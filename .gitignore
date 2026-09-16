@@ -9,6 +9,7 @@ venv/
 .claude
 docs/*
 !docs/ALFD_power_bound_method.md
+!docs/run_10015_shapes31.md
 research_papers
 data/
 results/
