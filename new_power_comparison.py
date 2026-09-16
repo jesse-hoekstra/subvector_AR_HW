@@ -9,6 +9,7 @@ import time
 import hashlib
 import json
 import platform
+import csv
 from gkm import critical_value
 
 
@@ -16,17 +17,20 @@ DGP_CACHE_SCHEMA_VERSION = 1
 DGP_CACHE_ALGORITHM = 'appendix_a3_feasible_power_v1'
 DGP_CACHE_PRODUCER = 'new_power_comparison.py'
 
-# These two revisions differ only in the now-removed bound-overlay code.  The
-# DGP simulation kernel and its schema-1 cache contract are byte-for-byte
-# unchanged.  Accepting only these audited predecessor hashes preserves
+# These revisions preserve the original three-nuisance DGP draw stream and
+# numerical path. They predate support for the two-nuisance design, so their
+# hashes are accepted only for the original configurations. Accepting these
+# audited predecessor hashes preserves
 # existing expensive caches without turning source-hash validation into an
 # arbitrary-hash escape hatch.
 _TRUSTED_PRE_DGP_ONLY_SOURCE_SHA256 = frozenset({
     '4b6c77087df18e90146a7a794cfb791556d6b8736ba214e30bcc910a93cf2123',
     '52baf65840c5f785815bc74063909bd98177d67fc62189dd12fb968591984c6b',
+    '286f0ac6a9b4bbe3ac3b78aeaed355e055cca72509830d6c2a1574079cf094dc',
 })
 
 VERSION_LABELS = {
+    '10015': (100, 15),
     '352515': (35, 25, 15),
     '1003015': (100, 30, 15),
     '1009590': (100, 95, 90),
@@ -193,8 +197,10 @@ def load_compatible_dgp_cache(path, *, version_label, kappas, k, n, alpha,
     with np.load(path, allow_pickle=False) as archive:
         saved_source_hash = _npz_scalar(archive, 'source_sha256')
         current_source_hash = expected_settings['source_sha256']
-        trusted_source_hashes = (
-            _TRUSTED_PRE_DGP_ONLY_SOURCE_SHA256 | {current_source_hash})
+        trusted_source_hashes = {current_source_hash}
+        if (version_label in ('352515', '1003015', '1009590')
+                and len(kappas) == 3):
+            trusted_source_hashes |= _TRUSTED_PRE_DGP_ONLY_SOURCE_SHA256
         if saved_source_hash not in trusted_source_hashes:
             raise ValueError(
                 'incompatible DGP cache: source_sha256='
@@ -273,7 +279,13 @@ _SIGMA = np.array([
 
 def _dgp_build_constants(kappas, n, k):
     """Per-(kappas, n, k) DGP constants: Pi_W, pi_x, gamma. Cheap to recompute."""
-    Sigma = _SIGMA
+    kappas = np.asarray(kappas, dtype=float)
+    if (k != 7 or kappas.ndim != 1 or len(kappas) not in (2, 3)
+            or not np.all(np.isfinite(kappas)) or np.any(kappas < 0)
+            or n <= k + 1):
+        raise ValueError('the configured DGP requires k=7, n>k+1, and 2 or 3 finite nonnegative kappas')
+    m_W = len(kappas)
+    Sigma = _SIGMA[:m_W + 2, :m_W + 2]
     Sigma_eps_eps = Sigma[0, 0]
     Sigma_eps_Vw = Sigma[0, 2:]
     Sigma_Vw_Vw = Sigma[2:, 2:]
@@ -288,10 +300,19 @@ def _dgp_build_constants(kappas, n, k):
         [0, 0, 1/np.sqrt(n*2)],
         [0, 0, 1/np.sqrt(n*2)],
     ])
-    Pi_W = A @ sqrtm(np.diag(kappas)) @ sqrt_Sigma
+    Pi_W = A[:, :m_W] @ sqrtm(np.diag(kappas)) @ sqrt_Sigma
     pi_x = (4.0 / np.sqrt(k * n)) * np.array([1, 1, 1, -1, 1, 1, 1])
-    gamma_params = np.array([-1.0, 1.0, 1.0])
+    gamma_params = np.array([-1.0, 1.0, 1.0])[:m_W]
     return Pi_W, pi_x, gamma_params
+
+
+def _mw2_eigenvalues(Z_dm, y_0_W, n, k):
+    """Compute the same projected cross-products without an n-by-n projector."""
+    ZY = Z_dm.T @ y_0_W
+    temp = ZY.T @ np.linalg.solve(Z_dm.T @ Z_dm, ZY)
+    Omega_hat = (y_0_W.T @ y_0_W - temp) / (n - k - 1)
+    evals = eigh(temp, Omega_hat, eigvals_only=True)
+    return np.sort(np.real(evals))[::-1]
 
 
 def _dgp_chunk_worker(args):
@@ -310,15 +331,16 @@ def _dgp_chunk_worker(args):
      hat_k1_grid, cv_grid, cv_chi2, seed_seq) = args
 
     Pi_W, pi_x, gamma_params = _dgp_build_constants(kappas, n, k)
-    Sigma = _SIGMA
+    m_W = len(kappas)
+    Sigma = _SIGMA[:m_W + 2, :m_W + 2]
     rng = np.random.default_rng(seed_seq)
-    I_n = np.eye(n)
-    mean5 = np.zeros(5)
+    I_n = np.eye(n) if m_W == 3 else None
+    error_mean = np.zeros(m_W + 2)
 
     rej_chi2 = rej_c1 = rej_cp1 = 0
     for _ in range(n_sims):
         Z = rng.standard_normal((n, k))
-        errors = rng.multivariate_normal(mean5, Sigma, n)
+        errors = rng.multivariate_normal(error_mean, Sigma, n)
         eps = errors[:, 0]
         V_X = errors[:, 1]
         V_W = errors[:, 2:]
@@ -332,15 +354,17 @@ def _dgp_chunk_worker(args):
         y_0_dm = y_0 - y_0.mean()
         W_dm = W - W.mean(axis=0)
 
-        P_Z = Z_dm @ inv(Z_dm.T @ Z_dm) @ Z_dm.T
-        M_Z = I_n - P_Z
         y_0_W = np.column_stack([y_0_dm, W_dm])
-
-        Omega_hat = (y_0_W.T @ M_Z @ y_0_W) / (n - k - 1)
-        temp = y_0_W.T @ P_Z @ y_0_W
-
-        evals = eigh(temp, Omega_hat, eigvals_only=True)
-        evals = np.sort(np.real(evals))[::-1]
+        if m_W == 2:
+            evals = _mw2_eigenvalues(Z_dm, y_0_W, n, k)
+        else:
+            # Preserve the original three-nuisance simulation path and draws.
+            P_Z = Z_dm @ inv(Z_dm.T @ Z_dm) @ Z_dm.T
+            M_Z = I_n - P_Z
+            Omega_hat = (y_0_W.T @ M_Z @ y_0_W) / (n - k - 1)
+            temp = y_0_W.T @ P_Z @ y_0_W
+            evals = eigh(temp, Omega_hat, eigvals_only=True)
+            evals = np.sort(np.real(evals))[::-1]
         test_stat = evals[-1]
 
         if test_stat > cv_chi2:
@@ -375,6 +399,7 @@ def simulate_power_dgp(betas, kappas, n=250, k=7, num_simulations=100000,
         raise ValueError('betas must be a nonempty finite vector')
     if int(num_simulations) <= 0 or int(chunk_size) <= 0:
         raise ValueError('num_simulations and chunk_size must be positive')
+    _dgp_build_constants(kappas, n, k)  # Validate before constructing workers.
 
     k_cv = k - m_W + 1
     if hat_k1_grid is None:
@@ -450,6 +475,8 @@ def main():
                               + ", ".join(VERSION_LABELS) + ")"))
     parser.add_argument('--num-simulations', type=int, default=100000,
                         help='finite-sample draws per beta')
+    parser.add_argument('--beta-count', type=int, default=81,
+                        help='odd number of equally spaced beta values from -2 to 2 (default: 81)')
     parser.add_argument('--workers', type=int, default=None,
                         help='worker processes (default: at most 8)')
     parser.add_argument('--seed', type=int, default=20240101,
@@ -462,12 +489,18 @@ def main():
                         help='report cache/simulation scale and exit without plotting')
     parser.add_argument('--acknowledge-expensive', action='store_true',
                         help='required before generating a missing DGP cache')
+    parser.add_argument('--no-show', action='store_true',
+                        help='save the plot without opening an interactive window')
     args = parser.parse_args()
 
     if args.num_simulations <= 0:
         parser.error('--num-simulations must be positive')
     if args.chunk_size <= 0:
         parser.error('--chunk-size must be positive')
+    if args.beta_count < 3 or args.beta_count % 2 != 1:
+        parser.error('--beta-count must be an odd integer of at least 3')
+    if args.seed < 0:
+        parser.error('--seed must be nonnegative')
     n_workers = (min(8, os.cpu_count() or 1)
                  if args.workers is None else args.workers)
     if n_workers <= 0:
@@ -493,7 +526,7 @@ def main():
     print(f"Version {args.version}: kappas={kappas.tolist()}, n={n}, k={k}")
     print(f"  output dir: {out_dir}/")
 
-    betas = np.linspace(-2, 2, 81)
+    betas = np.linspace(-2, 2, args.beta_count)
 
     # Schema-versioned cache for the three feasible-test curves.
     kappa_tag = "_".join(str(int(round(x))) for x in kappas)
@@ -560,6 +593,20 @@ def main():
             chunk_size=args.chunk_size, workers_used=n_workers)
         print(f"Saved {cache_file}")
 
+    csv_file = os.path.join(out_dir, f'dgp_curves_{args.version}.csv')
+    with open(csv_file + '.tmp', 'w', newline='') as handle:
+        writer = csv.writer(handle)
+        writer.writerow(['beta', 'power_chi2', 'power_chi2_se',
+                         'power_c1', 'power_c1_se',
+                         f'power_c{m_W}', f'power_c{m_W}_se'])
+        for beta, *powers in zip(betas, power_chi2, power_c1, power_cp1):
+            row = [beta]
+            for power in powers:
+                row.extend([power, np.sqrt(power * (1 - power) / args.num_simulations)])
+            writer.writerow(row)
+    os.replace(csv_file + '.tmp', csv_file)
+    print(f'Saved {csv_file}')
+
     print("\nPlotting results...")
     plt.figure(figsize=(9, 5.5))
     plt.plot(betas, power_chi2, linestyle='--', color='tab:blue',
@@ -567,7 +614,7 @@ def main():
     plt.plot(betas, power_c1, linestyle='-', color='tab:orange',
              label=r'$c_1$')
     plt.plot(betas, power_cp1, linestyle='-.', color='tab:red',
-             label=r'$c_3$')
+             label=rf'$c_{m_W}$')
     plt.axhline(y=alpha, color='gray', linestyle=':',
                 label=rf'$\alpha={alpha:g}$')
     plt.title(rf'Power Curve for $\kappa$ = {kappas.tolist()}')
@@ -586,7 +633,9 @@ def main():
     out_png = os.path.join(out_dir, f"power_curve_kappas_{kappa_tag}.png")
     plt.savefig(out_png, dpi=140)
     print(f"Saved {out_png}")
-    plt.show()
+    if not args.no_show:
+        plt.show()
+    plt.close()
 
 
 if __name__ == "__main__":

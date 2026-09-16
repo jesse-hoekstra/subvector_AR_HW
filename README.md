@@ -168,8 +168,8 @@ environment, grid, seed, `--n-fit`, and adaptive-M settings unchanged between
 building and using the bank. Worker count, beta count, `--n-power`, and
 `--n-iter` do not enter the bank identity. Existing `352515` caches remain
 on disk, but the strict source-hash check means they need the original code
-revision for reuse. The separate finite-sample comparison, watcher, and
-refinement scripts still target the existing `m_W=3` workflows.
+revision for reuse. The finite-sample comparison also supports `10015`;
+the existing live watcher and refinement scripts target `m_W=3` workflows.
 
 ### Use several SSH-accessible CPU nodes with shared storage
 
@@ -354,6 +354,62 @@ The merged result is sorted by beta and written below `10015/gkm_direct/power17/
 `gkm_bounds_10015.csv` contains the bound estimates and Monte Carlo standard
 errors, and `power_bound_10015.png` plots the bound curve.
 The separate existing `m_W=3` watcher and refinement scripts are not required.
+
+### Simulate the other power curves locally for 10015
+
+`new_power_comparison.py` now supports the same two-nuisance design as the
+`10015` bound: `kappa=[100,15]`, `k=7`, `n=250`, `alpha=0.05`. It simulates
+the feasible tests labelled chi-squared, `c_1`, and `c_2` (the last conditions
+on the second-smallest of three eigenvalues). The beta-zero rejection
+probability is simulated too. No null bank or native MHG library is needed.
+
+From the local repository root:
+
+```bash
+source .venv/bin/activate
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1 BLIS_NUM_THREADS=1
+
+python -u new_power_comparison.py --version 10015 \
+  --beta-count 17 --num-simulations 100000 --workers 4 \
+  --seed 20240101 --chunk-size 5000 \
+  --acknowledge-expensive --no-show
+```
+
+Choose the local worker count according to the cores available on your computer.
+This is 1,700,000 finite-sample draws across `[-2,-1.75,...,0,...,1.75,2]`.
+Add `--preflight-only` to inspect the run without simulation. For smoother
+feasible-test lines use `--beta-count 81` instead (8,100,000 draws); the bound
+can remain at 17 points. Choose the grid before the run: the cache records it,
+and changing it requires explicit replacement with `--force`.
+
+Outputs below `10015/dgp/`:
+
+- `dgp_curves_10015.npz`: the three curves with settings and provenance.
+- `dgp_curves_10015.csv`: power and binomial Monte Carlo standard errors.
+- `power_curve_kappas_100_15.png`: the three feasible-test curves.
+- `dgp_curves_run.log`: simulation progress and completion messages.
+
+The NPZ uses the existing key `power_cp1` for the `c_2` curve; the CSV calls it
+`power_c2`. Results are reproducible across worker counts when the beta grid,
+seed, simulation count, and chunk size stay fixed. A completed compatible
+cache is reused; an interrupted simulation must restart the DGP sweep.
+
+Once the four-node bound has been merged, copy just its completed
+`gkm_eigval_10015.npz` into local `10015/gkm_direct/power17/`, then run:
+
+```bash
+python plot_power_comparison.py --version 10015 \
+  --bound 10015/gkm_direct/power17/gkm_eigval_10015.npz
+```
+
+This writes `10015/power_comparison_10015.png` and a CSV beside it with all
+plotted values and Monte Carlo standard errors. It validates the experiment
+settings and the bound's saved per-beta hashes; viewing a result does not
+require the remote machine's environment or its null bank. Omit `--bound`
+to plot only the saved feasible-test curves. The curves are Monte Carlo
+estimates; the CSV standard errors describe simulation noise, not the
+finite-null-grid approximation in the bound.
 
 ### Add midpoints to a completed bound curve
 
