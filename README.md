@@ -362,6 +362,18 @@ workload, see [the complete 31-shape run commands](docs/run_10015_shapes31.md).
 This uses the existing scripts unchanged, retains the earlier null points,
 and saves the new bank and power results under `10015/gkm_direct/shapes31/`.
 
+### Calculate kappa=[50,15] with nine shapes on four nodes
+
+The existing scripts accept `--version 5015` for `m_W=2`, `kappa=[50,15]`.
+Use the same null-bank and power-bound workflow above, with `--grid-shapes 9`
+on null preparation and paths under `5015/gkm_direct/shapes9/`. This grid has
+65 nulls, including the additional exact `(50,15)` anchor.
+Recalculate the DGP curves using `new_power_comparison.py --version 5015
+--beta-count 17`; this existing simulator uses the local cores of one node.
+Use `plot_power_comparison.py --version 5015` for the combined plot.
+Source hashes are part of the cache identity, so retain the previous code
+revision when resuming or reusing older runs after adding this preset.
+
 ### Simulate the other power curves locally for 10015
 
 `new_power_comparison.py` now supports the same two-nuisance design as the

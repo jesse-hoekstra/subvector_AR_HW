@@ -30,6 +30,7 @@ _TRUSTED_PRE_DGP_ONLY_SOURCE_SHA256 = frozenset({
 })
 
 VERSION_LABELS = {
+    '5015': (50, 15),
     '10015': (100, 15),
     '352515': (35, 25, 15),
     '1003015': (100, 30, 15),
