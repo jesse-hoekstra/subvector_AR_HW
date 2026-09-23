@@ -58,6 +58,14 @@ POOLED_IS_METHOD = "gkm_stratified_equal_null_mixture_v1"
 GRID_DESIGN_BETA_COUNT = 81
 
 ALLOWED_CONFIGS = {
+    (15, 15): dict(
+        M_start=20,
+        standard=[(15.0, 15.0)],
+    ),
+    (35, 15): dict(
+        M_start=20,
+        standard=[(35.0, 15.0)],
+    ),
     (50, 15): dict(
         M_start=20,
         standard=[(50.0, 15.0)],
@@ -86,6 +94,8 @@ ALLOWED_CONFIGS = {
 # Version labels selectable on the command line (python alfd_eigval.py --version <label>).
 # Each maps to a key in ALLOWED_CONFIGS.
 VERSION_LABELS = {
+    "1515": (15, 15),
+    "3515": (35, 15),
     "5015": (50, 15),
     "10015": (100, 15),
     "352515": (35, 25, 15),
@@ -284,6 +294,8 @@ MHG_LARGE_TRACE_THRESHOLD = 120.0
 MHG_LARGE_TRACE_MARGIN = 60.0
 MHG_BENCHMARK_SEED = 0x454D57
 MHG_DEFAULT_BENCHMARK_SAMPLES = {
+    (15, 15): 64,
+    (35, 15): 64,
     (50, 15): 64,
     (100, 15): 64,
     (35, 25, 15): 64,
