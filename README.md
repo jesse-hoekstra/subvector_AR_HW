@@ -15,11 +15,12 @@ empirical replication.
 | `plot_power_comparison.py` | Read saved feasible-test and bound results, then write the combined figure and CSV. |
 | `simulation_plot_executable.py` | Interactive illustration of the conditional eigenvalue CDF and its GKM approximation. |
 | `empirical_Vietnam.py` | Standalone empirical replication, validation against published results, and HW confidence intervals. |
-| `koev/mhg15/mhg_core.c` | Native matrix-hypergeometric evaluator used by the bound calculation. |
+| `koev/mhg15/mhg_core.c` | Adapted native matrix-hypergeometric evaluator used by the bound calculation. |
 | `koev/mhg15/mhg.py`, `koev/mhg15/build.sh` | Python interface and build command for that evaluator. |
 
-Other files under `koev/` preserve the upstream distribution, documentation,
-and licence. They are not additional calculation steps.
+The `koev/` directory is included in the repository. It contains the upstream
+distribution, documentation, and licence, together with the adapted C evaluator
+and Python interface used here.
 
 The power comparison has two independent inputs:
 
@@ -44,8 +45,9 @@ python -m pip install -r requirements.txt
 ```
 
 The power-bound calculation also requires a C compiler and a POSIX shell
-(macOS or Linux). Build its native library before running `alfd_eigval.py`,
-including its help and preflight commands:
+(macOS or Linux). Its native source, Python wrapper, build script, and licence
+are included under `koev/mhg15/`. Build the native library before running
+`alfd_eigval.py`, including its help and preflight commands:
 
 ```bash
 sh koev/mhg15/build.sh

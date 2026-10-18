@@ -1,29 +1,14 @@
-"""
-Eigenvalue-density-based ALFD power bound for m_W = 2 or 3 (p = m_W + 1).
+"""Monte Carlo power-bound estimates from ordered eigenvalues (m_W = 2 or 3).
 
-Uses the noncentral-Wishart joint density of (real) ordered eigenvalues of a
-noncentral Wishart matrix. The matrix hypergeometric 0F1^(2)((1/2)k; (1/4)Ω, S)
-is evaluated via Plamen Koev's mhg algorithm (Koev & Edelman 2006). We call a
-standalone C port of Koev's mhg.c directly from Python (ctypes) — no MATLAB or
-Octave required.
+Implements GKM Supplement D.3.2 / EMW on a finite null grid for tests measurable
+with respect to the ordered eigenvalue vector. A shared ordinary importance-
+sampling bank is used to fit a least-favourable null mixture, calibrate its
+test, and apply the Step 8/9 grid adjustment.
 
-The calculation bounds tests measurable with respect to the ordered eigenvalue
-vector (the invariant class studied in the reference application).  It is a
-direct higher-dimensional extension of GKM Supplement D.3.2 / EMW:
-one pooled ordinary-importance-sampling null bank, the fixed EMW weight update,
-the Step-6 mixture calibration, and the Step-8/9 grid adjustment.  Numerical
-matrix-hypergeometric truncation remains adaptive for every density pair.
-
-Setup (one-time):
-    # Koev's mhg15 package lives in ~/Oxford/subvector_AR_HW/koev/mhg15/
-    # Build the shared library once (needs only clang / Xcode CLT):
-    sh ~/Oxford/subvector_AR_HW/koev/mhg15/build.sh
-    # -> produces libmhg.dylib and its mhg_core.c SHA-256 stamp next to mhg.py.
-
-Run:
-    python3 alfd_eigval.py --version 1009590 --profile production --preflight-only
-    python3 alfd_eigval.py --version 1009590 --profile production \
-        --acknowledge-expensive
+The noncentral-Wishart eigenvalue density uses the matrix hypergeometric
+function 0F1^(2)(k/2; Ω/4, S), evaluated by a standalone C port of Plamen Koev's
+mhg algorithm (Koev & Edelman 2006). Truncation is adaptive for each density
+pair, using a numerical coefficient-tail criterion.
 """
 
 import os
@@ -43,10 +28,8 @@ from scipy.special import logsumexp
 
 
 # ============================================================
-# Allowed kappa configurations (m_W = 2 or 3)
-# Each provides a *starting* 0F1 order.  Every density evaluation now checks
-# its coefficient tail and increases the order locally when needed, so this is
-# no longer a numerical result that users have to tune by rerunning a curve.
+# Experiment configurations (m_W = 2 or 3)
+# M_start is the initial truncation order for adaptive 0F1 evaluation.
 # ============================================================
 
 RESULT_SCHEMA_VERSION = 4
@@ -91,8 +74,7 @@ ALLOWED_CONFIGS = {
     ),
 }
 
-# Version labels selectable on the command line (python alfd_eigval.py --version <label>).
-# Each maps to a key in ALLOWED_CONFIGS.
+# Command-line labels for the kappa configurations above.
 VERSION_LABELS = {
     "1515": (15, 15),
     "3515": (35, 15),
@@ -105,11 +87,14 @@ VERSION_LABELS = {
 
 
 # ============================================================
-# Self-contained sampling / NCP utilities (HW Appendix A.3 DGP)
+# Sampling and noncentrality utilities (HW Appendix A.3)
 # ============================================================
 
 def build_M(kappas, k_eff):
-    """k_eff x p matrix M with M'M = diag(kappas). Requires k_eff >= p."""
+    """Construct a k_eff x p mean matrix M with M.T @ M = diag(kappas).
+
+    Requires nonnegative kappas and k_eff >= p.
+    """
     p = len(kappas)
     M = np.zeros((k_eff, p))
     for j in range(p):
@@ -119,7 +104,7 @@ def build_M(kappas, k_eff):
 
 
 def simulate_Xi(M, n_sim, rng):
-    """n_sim independent Xi ~ Matrix-Normal(M, I_{kp})."""
+    """Draw n_sim matrices with mean M and independent N(0, 1) errors."""
     k, p = M.shape
     return rng.standard_normal((n_sim, k, p)) + M[None, :, :]
 
@@ -205,7 +190,7 @@ def asymptotic_ncp_eigenvalues(beta, kappas, k, n):
 
 
 # ============================================================
-# mhg setup (standalone C core via ctypes — no Octave/MATLAB)
+# Native matrix-hypergeometric evaluator
 # ============================================================
 
 KOEV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'koev')
@@ -221,7 +206,7 @@ def _sha256_file(path):
 
 
 def _verify_mhg_build_provenance(mhg_dir, lib_name):
-    """Fail closed unless the shared library was built from this C source."""
+    """Verify that the build stamp matches the current mhg_core.c source."""
     source = os.path.join(mhg_dir, 'mhg_core.c')
     stamp = os.path.join(mhg_dir, f'{lib_name}.mhg_core.sha256')
     build = os.path.join(mhg_dir, 'build.sh')
@@ -257,8 +242,9 @@ def _verify_mhg_build_provenance(mhg_dir, lib_name):
 def setup_mhg(mhg_dir=MHG_DIR):
     """Import the standalone C mhg wrapper (Koev & Edelman 2006).
 
-    Returns the callable ``mhg(arg0, alpha, p, q, x, y=None)`` from
-    ``koev/mhg15/mhg.py``, which dispatches to ``libmhg.dylib``.
+    Return the callable ``mhg(arg0, alpha, p, q, x, y=None)`` from
+    ``koev/mhg15/mhg.py``. It loads ``libmhg.dylib`` on macOS or ``libmhg.so``
+    on Linux.
     """
     lib_name = 'libmhg.dylib' if sys.platform == 'darwin' else 'libmhg.so'
     lib = os.path.join(mhg_dir, lib_name)
@@ -279,12 +265,9 @@ _mhg = setup_mhg()
 
 
 # ============================================================
-# mhg wrappers
+# Adaptive matrix-hypergeometric evaluation
 # ============================================================
 
-# The C routine accumulates the per-degree coefficients internally whether or
-# not Python asks to receive them.  Returning them therefore adds negligible
-# work and lets every call make an explicit convergence decision.
 MHG_CONV_TOL = 1e-10
 MHG_DEFAULT_STEP = 20
 MHG_DEFAULT_MAX = 300
@@ -306,7 +289,7 @@ MHG_MAX_BENCHMARK_SAMPLES = 256
 
 
 class MHGConvergenceError(RuntimeError):
-    """Raised rather than silently accepting an under-truncated 0F1 series."""
+    """Raised when a 0F1 evaluation fails the numerical convergence checks."""
 
 
 @dataclass(frozen=True)
@@ -322,19 +305,15 @@ class MHGSeriesAssessment:
 
 def assess_mhg_series(value, coefficients, tol=MHG_CONV_TOL,
                       ratio_window=MHG_RATIO_WINDOW):
-    """Assess a positive 0F1 series from its per-total-degree coefficients.
+    """Assess convergence from the per-total-degree coefficients of 0F1.
 
-    The old check inspected only ``coef[-1]``.  That can be tiny even while a
-    sizeable omitted tail remains.  Here we require a run of positive,
-    contracting per-degree coefficients after the peak and extrapolate them
-    geometrically.  An abrupt ratio collapse while the preceding coefficient
-    still carries material mass is treated as arithmetic underflow, not
-    convergence.  A failed assessment causes the caller to increase the order
-    for this *one density value*.
+    A geometric continuation of the final positive coefficients estimates
+    the omitted tail. Convergence requires contracting, approximately
+    nonincreasing coefficient ratios after the peak and an estimated
+    remainder below ``tol`` relative to the coefficient sum. Abrupt ratio
+    collapses and material trailing zeros are flagged as numerical failures.
 
-    The estimate is a numerical stopping criterion, not a symbolic remainder
-    theorem for matrix 0F1.  The run records the tolerance and maximum selected
-    order, and fails at ``M_max`` so accuracy cannot pass silently.
+    This is a numerical stopping criterion, not a rigorous error bound.
     """
     if not np.isfinite(tol) or not (1e-13 <= float(tol) < 1.0):
         raise ValueError("tol must be finite and lie in [1e-13, 1)")
@@ -349,9 +328,7 @@ def assess_mhg_series(value, coefficients, tol=MHG_CONV_TOL,
     if not np.all(np.isfinite(coef)) or value <= 0.0:
         return MHGSeriesAssessment(False, np.inf, np.inf, np.inf, -1, -1, True)
 
-    # Coefficients are nonnegative for the arguments used here.  Permit only
-    # round-off-sized negative noise; a material negative coefficient signals
-    # a broken evaluation rather than convergence.
+    # Allow only round-off-sized negative mass in the nonnegative series.
     neg_mass = float(-coef[coef < 0.0].sum())
     scale = max(abs(float(value)), 1.0)
     if neg_mass > 1e-13 * scale:
@@ -378,13 +355,8 @@ def assess_mhg_series(value, coefficients, tol=MHG_CONV_TOL,
                                    peak, last_positive,
                                    trailing_material_zero)
 
-    # Detect the exact signature of representational underflow: a coefficient
-    # ratio suddenly collapses even though the previous degree is still
-    # material.  Merely increasing M cannot repair this and must not produce a
-    # false plateau.
-    # Start only after a short post-peak run.  Early ratios can legitimately
-    # drop quickly (for scalar 0F1, q_d=z/((c+d-1)d)); the arithmetic-failure
-    # fingerprint is a late collapse from a still-large ratio.
+    # Flag abrupt post-peak ratio drops while the preceding term is material.
+    # Skip early ratios, which can decrease rapidly even in scalar 0F1.
     post_start = max(peak + int(ratio_window), 1)
     post_coef = coef[post_start - 1:last_positive + 1]
     post_ratios = post_coef[1:] / post_coef[:-1]
@@ -402,9 +374,8 @@ def assess_mhg_series(value, coefficients, tol=MHG_CONV_TOL,
     remainder = (float(coef[last_positive] * rho / (1.0 - rho) / total)
                  if contracting else np.inf)
     last_ratio = float(coef[last_positive] / total)
-    # The historical C failure ended a still-material series with exact zeros.
-    # A zero tail is harmless only after the observed coefficient and its
-    # geometric continuation are already below tolerance.
+    # Trailing zeros are accepted only when the final positive term and its
+    # estimated geometric continuation are both below tolerance.
     if last_positive < coef.size - 1 and (last_ratio > tol or remainder > tol):
         collapse = True
     converged = bool(not collapse and monotone and contracting
@@ -465,10 +436,9 @@ def mhg_two_matrix_adaptive(c, Omega_eigs, S_eigs, M_start=20,
                             tol=MHG_CONV_TOL,
                             ratio_window=MHG_RATIO_WINDOW,
                             trace_margin=MHG_TRACE_MARGIN):
-    """Evaluate 0F1^(2), increasing total degree only for difficult pairs.
+    """Evaluate 0F1^(2) with adaptive truncation for one eigenvalue pair.
 
-    Returns ``(value, selected_order, assessment, raw_evaluations)``.  This is
-    the mechanism that replaces curve-level trial runs at several M values.
+    Return ``(value, selected_order, assessment, raw_evaluations)``.
     """
     M_start = _validated_integer("M_start", M_start)
     M_step = _validated_integer("M_step", M_step)
@@ -490,10 +460,8 @@ def mhg_two_matrix_adaptive(c, Omega_eigs, S_eigs, M_start=20,
     effective_margin = max(
         float(trace_margin),
         MHG_LARGE_TRACE_MARGIN if tau >= MHG_LARGE_TRACE_THRESHOLD else 0.0)
-    # Strong p=4 calls consistently need about tau+60 terms.  Starting there
-    # avoids recomputing the entire partition traversal once.  If the heuristic
-    # exceeds the user cap, evaluate at M_max before failing; the trace proxy is
-    # not itself a convergence theorem.
+    # Use a trace-based heuristic to choose the initial order, capped at M_max.
+    # Convergence is determined by the coefficient assessment below.
     order = min(max(M_start, int(np.ceil(tau + effective_margin))), M_max)
     raw_evaluations = 0
     while True:
@@ -536,14 +504,11 @@ def mhg_two_matrix_batch(c, Omegas, S_batch, M_trunc=20,
                          mhg_tol=MHG_CONV_TOL,
                          ratio_window=MHG_RATIO_WINDOW,
                          return_diagnostics=False):
-    """
-    Vectorized: returns (G, N) matrix of 0F1^(2)(c; (1/4)Ω_g, S_n) values.
+    """Evaluate all pairs of noncentrality and sample eigenvalue vectors.
 
-    Omegas : (G, p) array — NCP eigenvalue tuples (each row)
-    S_batch: (N, p) array — observed eigenvalue tuples (each row)
-
-    Each (g, n) pair is a direct C call (no IPC), so a plain Python loop is
-    fine — and faster than the old single-Octave-round-trip batching.
+    ``Omegas`` has shape (G, p), and ``S_batch`` has shape (N, p). The result
+    has shape (G, N); each pair uses adaptive truncation. If requested,
+    return ``(result, diagnostics)``.
     """
     Omegas = np.asarray(Omegas, dtype=float)
     S = np.asarray(S_batch, dtype=float)
@@ -572,13 +537,10 @@ def mhg_two_matrix_batch(c, Omegas, S_batch, M_trunc=20,
 
 
 def _mhg_chunk_worker(args):
-    """
-    Worker function for one chunk of S samples (used by multiprocessing.Pool).
-    Module-level so it pickles cleanly. Relies on `_mhg` being set at import
-    time in each spawned worker process (setup_mhg() runs in every worker).
+    """Evaluate one sample chunk in a multiprocessing worker.
 
-    args : (chunk_id, c, Omegas, S_chunk, adaptive-options)
-    returns : (chunk_id, ndarray of shape (G, len(S_chunk)), diagnostics)
+    The native evaluator is initialized when a spawned worker imports this
+    module. Return the chunk index, a (G, len(S_chunk)) array, and diagnostics.
     """
     (chunk_id, c, Omegas, S_chunk, M_start, M_step, M_max,
      mhg_tol, ratio_window) = args
@@ -621,13 +583,10 @@ def chunked_mhg_batch(c, Omegas, S_batch, M_trunc=20,
                       M_max=MHG_DEFAULT_MAX, mhg_tol=MHG_CONV_TOL,
                       ratio_window=MHG_RATIO_WINDOW,
                       return_diagnostics=False):
-    """
-    Run mhg over S_batch in chunks of `chunk_size` samples, printing
-    progress and an ETA based on observed throughput.
+    """Evaluate sample chunks serially or with a process pool.
 
-    n_workers : 1 = serial (original behaviour).  >1 = use multiprocessing.Pool
-                with that many worker processes; chunks are dispatched
-                independently via imap_unordered.
+    ``chunk_size`` is the maximum number of samples per task. Results retain
+    the input sample order; progress reports include throughput and an ETA.
     """
     Omegas = np.asarray(Omegas, dtype=float)
     S_batch = np.asarray(S_batch, dtype=float)
@@ -640,9 +599,7 @@ def chunked_mhg_batch(c, Omegas, S_batch, M_trunc=20,
 
     n_workers = _validated_integer("n_workers", n_workers)
     chunk_size = _validated_integer("chunk_size", chunk_size)
-    # Keep at least ~4 tasks per worker for small batches, but never enlarge
-    # the requested chunks for a large bank. Adaptive costs vary greatly by
-    # stratum; small tasks let idle workers pick up remaining expensive draws.
+    # Use smaller chunks to balance variable evaluation costs across workers.
     if n_workers > 1:
         chunk_size = min(chunk_size, max(1, N // (4 * n_workers)))
 
@@ -653,7 +610,6 @@ def chunked_mhg_batch(c, Omegas, S_batch, M_trunc=20,
     last_print = t_start
 
     if n_workers <= 1:
-        # ----- Serial path -----
         for ci, (i0, i1) in enumerate(chunk_bounds):
             _, chunk_result, chunk_diag = _mhg_chunk_worker(
                 (ci, c, Omegas, S_batch[i0:i1], M_trunc, M_step, M_max,
@@ -674,7 +630,6 @@ def chunked_mhg_batch(c, Omegas, S_batch, M_trunc=20,
                       f"~{eta:5.1f}s left)", flush=True)
                 last_print = now
     else:
-        # ----- Parallel path: Pool of workers -----
         from multiprocessing import Pool
         args_list = [(ci, c, Omegas, S_batch[i0:i1], M_trunc, M_step,
                       M_max, mhg_tol, ratio_window)
@@ -712,21 +667,19 @@ def chunked_mhg_batch(c, Omegas, S_batch, M_trunc=20,
 
 
 # ============================================================
-# Sanity check
+# Native evaluator checks
 # ============================================================
 
 def verify_mhg():
-    """Quick checks that the mhg C core is wired up correctly."""
+    """Check native evaluations against zero-argument and scalar identities."""
     print("Verifying mhg (C core) setup...")
 
-    # (1) Zero arguments => 0F1 = 1
     v = mhg_two_matrix(3.5, [0, 0, 0, 0], [0, 0, 0, 0], M_trunc=10)
     print(f"  0F1(3.5; 0, 0)              = {v:.6f}  (expect 1.0)")
     if abs(v - 1.0) >= 1e-6:
         raise RuntimeError("mhg zero-argument regression failed")
 
-    # (2) p=1 scalar consistency: 0F1(c; x, y) at p=1 should equal scalar 0F1(c; x*y/4)
-    #     (with our convention Omega/4)
+    # For p=1, the matrix function reduces to scalar 0F1(c; Omega*S/4).
     from scipy.special import hyp0f1
     c = 2.5
     x_om, y_s = 4.0, 3.0
@@ -736,8 +689,7 @@ def verify_mhg():
     if abs(v_mat - v_sca) / max(1.0, abs(v_sca)) >= 1e-3:
         raise RuntimeError("mhg scalar regression failed")
 
-    # This large scalar case detects the old reciprocal-factor underflow.  The
-    # broken core falsely plateaued 33% low while reporting a zero tail.
+    # Check adaptive truncation against a large scalar reference value.
     z_large = 10_000.0
     v_large, order_large, assessment_large, _ = mhg_two_matrix_adaptive(
         3.5, [4.0 * z_large], [1.0], M_start=20, M_max=300,
@@ -749,7 +701,6 @@ def verify_mhg():
     if not assessment_large.converged or rel_large > MHG_CONV_TOL:
         raise RuntimeError("mhg large-scalar underflow regression failed")
 
-    # (3) Batched call: small (G, N)
     Om_mat = np.array([[4.0], [8.0]])
     S_mat = np.array([[3.0], [5.0]])
     vb = mhg_two_matrix_batch(c, Om_mat, S_mat, M_trunc=30)
@@ -767,12 +718,13 @@ def log_eigval_density_partial(S_batch, Omegas, c, M_trunc=20,
                               M_max=MHG_DEFAULT_MAX,
                               mhg_tol=MHG_CONV_TOL,
                               return_diagnostics=False):
-    """
-    Log of the eigenvalue density f(x_1,...,x_p | Ω) up to an x-dependent
-    constant. The omitted constant cancels in importance weights and in the
-    LR-style test comparison used by ALFD.
+    """Log eigenvalue density up to an additive term independent of Ω.
 
-    partial[g, n] = log 0F1^(2)(c; (1/4)Ω_g, S_n) - 0.5 * sum(Ω_g)
+    The omitted term depends only on the sample eigenvalues and cancels
+    in density ratios at a common sample, including importance weights
+    and likelihood-ratio comparisons.
+
+    result[g, n] = log 0F1^(2)(c; Ω_g/4, S_n) - sum(Ω_g)/2
     """
     vals, diagnostics = chunked_mhg_batch(
         c, Omegas, S_batch, M_trunc=M_trunc, chunk_size=chunk_size,
@@ -780,11 +732,6 @@ def log_eigval_density_partial(S_batch, Omegas, c, M_trunc=20,
         M_step=M_step, M_max=M_max, mhg_tol=mhg_tol,
         return_diagnostics=True)
 
-    # Finiteness guard: a nan/inf here means the mhg series overflowed (the
-    # historical [100,95,90] full-Omega bug) or otherwise misbehaved.  A nan
-    # used to slip silently through np.maximum(nan,1e-300)=nan -> log(nan)=nan,
-    # collapsing the power bound to 0.  Fail loudly instead, naming the
-    # offending (Omega, S) so it can never pass unnoticed again.
     if not np.all(np.isfinite(vals)):
         gbad, nbad = np.argwhere(~np.isfinite(vals))[0]
         Om_arr = np.asarray(Omegas, dtype=float)
@@ -798,9 +745,8 @@ def log_eigval_density_partial(S_batch, Omegas, c, M_trunc=20,
                vals[gbad, nbad])
         )
 
-    # 0F1^(2)(c; nonneg, nonneg) >= 1 always (its degree-0 term is 1 and all
-    # coefficients are nonnegative).  Reject a material violation; clamp only
-    # round-off at the last ulps rather than masking a broken evaluation.
+    # For the parameters used here, the unit constant term and nonnegative
+    # coefficients imply 0F1^(2) >= 1. Clip only values within the tolerance.
     if np.any(vals < 1.0 - 1e-12):
         gbad, nbad = np.argwhere(vals < 1.0 - 1e-12)[0]
         raise AssertionError(
@@ -815,30 +761,22 @@ def log_eigval_density_partial(S_batch, Omegas, c, M_trunc=20,
 
 
 # ============================================================
-# Null grid (lean: alt-nuisance + a few standard points)
+# Common nuisance-parameter grids
 # ============================================================
 
 
 
 def common_null_grid_3d(alt_nuisance_rows, config_kappas, standard_points=None,
                         n_shapes=6, n_strengths=7, max_strength=100.0):
-    """Deterministic common null grid for the three-dimensional nuisance cone.
+    """Construct a common null grid for three ordered nuisance eigenvalues.
 
-    GKM use 42 log-spaced points for their *scalar* nuisance parameter.  The
-    direct higher-dimensional analogue must cover both strength and shape.
-    This construction crosses nested shape directions with log-spaced largest
-    eigenvalues and adds the origin.  Defaults give ``1 + 6*7 = 43`` points.
+    Cross ``n_shapes`` normalized directions with ``n_strengths`` log-spaced
+    largest eigenvalues, then add the origin and any supplied standard points
+    not already represented. Direction candidates prioritize the configuration,
+    standard points, boundary rays, and extreme alternative-path shapes.
 
-    Shape candidates prioritize the configuration and any supplied stress
-    directions, followed by rank-one/rank-two/rank-three boundaries and the
-    alternative-path shapes having the smallest and largest third-eigenvalue
-    share.  The production default requests nine shapes, retaining all of
-    those directions for the configured experiments.  Additional shapes are
-    deterministic interior directions.  The same ordered grid is used for
-    every beta, which permits the GKM pooled null table to be cached and reused.
-    Supplied stress points themselves are then appended as exact anchors when
-    they are not already present on a ray; this preserves the historical null
-    checks as well as their directions.
+    The grid has ``1 + n_shapes * n_strengths`` points before additional
+    standard points. The same grid is used for every beta.
     """
     n_shapes = _validated_integer("n_shapes", n_shapes)
     n_strengths = _validated_integer("n_strengths", n_strengths)
@@ -910,7 +848,7 @@ def common_null_grid_3d(alt_nuisance_rows, config_kappas, standard_points=None,
         if len(shapes) == n_shapes:
             break
     if len(shapes) < n_shapes:
-        # A deterministic low-discrepancy fallback for unusually large grids.
+        # Add deterministic interior directions if the candidate list is exhausted.
         index = 1
         while len(shapes) < n_shapes:
             second = ((index * 0.6180339887498949) % 1.0)
@@ -942,13 +880,13 @@ def common_null_grid_3d(alt_nuisance_rows, config_kappas, standard_points=None,
 
 def common_null_grid_2d(alt_nuisance_rows, config_kappas, standard_points=None,
                         n_shapes=5, n_strengths=7, max_strength=100.0):
-    """Common null grid for two ordered nuisance eigenvalues.
+    """Construct a common null grid for two ordered nuisance eigenvalues.
 
-    Each ray is ``strength * (1, ratio)``. The configuration, rank-one and
-    equal-eigenvalue boundaries, and the extreme alternative-path ratios are
-    followed by fixed interior ratios if needed. Defaults give 36 rows,
-    including the origin, for the (100, 15) configuration. The exact configuration and any
-    explicitly supplied anchors are retained even when off the strength grid.
+    Each ray is ``strength * (1, ratio)``. Direction candidates prioritize the
+    configuration, boundary rays, and extreme alternative-path ratios, followed
+    by standard-point ratios and fixed interior ratios. Cross the selected
+    directions with log-spaced strengths, then add the origin, the configuration,
+    and any supplied standard points not already represented.
     """
     n_shapes = _validated_integer("n_shapes", n_shapes)
     n_strengths = _validated_integer("n_strengths", n_strengths)
@@ -1036,11 +974,11 @@ class EMWFitResult:
 
 @dataclass
 class PooledISBank:
-    """Stratified sample from an equal mixture of finite null laws.
+    """Stratified sample from an equal mixture of the grid's null distributions.
 
-    ``base_weights`` contain the *fixed* stratified integration factors.  They
-    sum to one, but the target contributions ``base*f_j/q`` must never be
-    self-normalized: GKM equation (D.1) is ordinary importance sampling.
+    ``base_weights`` are fixed integration factors summing to one. Target
+    contributions ``base_weights * f_j / q`` are used without normalization
+    by their realized sum, as in GKM equation (D.1).
     """
     grid: np.ndarray
     eigs: np.ndarray
@@ -1108,12 +1046,11 @@ def tail_rejection_probabilities(scores, rule):
 
 def calibrate_raw_weighted_tail(scores, raw_contributions, alpha,
                                 method="gkm_ordinary_is_exact"):
-    """Calibrate an absolute ordinary-IS tail without self-normalization.
+    """Calibrate a tail using ordinary importance-sampling contributions.
 
-    GKM equation (D.1) estimates an integral with fixed stratified weights.
-    Normalizing those contributions by their realized sum would silently turn
-    it into a different, biased finite-sample estimator.  Ties are randomized
-    so the *raw* estimated integral equals ``alpha`` exactly.
+    Use the contributions directly, without normalizing by their realized sum.
+    Randomization at the threshold makes the estimated tail mass equal to
+    ``alpha`` up to numerical precision.
     """
     scores = np.asarray(scores, dtype=float).ravel()
     weights = np.asarray(raw_contributions, dtype=float).ravel()
@@ -1301,13 +1238,11 @@ def common_grid_raw_is_tail_rule(scores, raw_target_contributions, alpha,
 
 def fit_gkm_weights_is(bank, log_g, alpha=0.05, n_iter=600,
                        step_size=2.0, active_weight_tol=1e-12):
-    """Run GKM Supplement D.3.2 Step 5 without algorithmic additions.
+    """Fit the null-mixture weights and calibrate its rejection threshold.
 
-    GKM initialize every coordinate of ``mu`` at -2, use the fixed scalar
-    step ``omega=2``, and perform exactly ``O=600`` updates.  In particular,
-    this implementation has no sign-switch damping, early stopping, or
-    best-iterate selection.  ``n_iter`` remains configurable for plumbing
-    tests, but reportable runs use 600.
+    Initialize ``mu`` at -2 and apply ``n_iter`` fixed-step updates, following
+    GKM Supplement D.3.2 Step 5. The defaults use 600 updates with step size 2.
+    Return the final iterate and its Step 6 calibrated rejection rule.
     """
     H, N = _validate_pooled_is_bank(bank)
     log_g = np.asarray(log_g, dtype=float).ravel()
@@ -1327,10 +1262,8 @@ def fit_gkm_weights_is(bank, log_g, alpha=0.05, n_iter=600,
         rp = ratios @ (bank.base_weights * rejection)
         mu += float(step_size) * (rp - alpha)
 
-    # Keep the normalized weights in log form for every likelihood-ratio
-    # calculation.  With 600 fixed updates, a mathematically positive GKM
-    # weight can be smaller than the least representable float; exponentiating
-    # it must not silently remove that null row from the mixture.
+    # Retain log weights so underflow does not remove small mixture components
+    # from likelihood-ratio calculations.
     log_weights = mu - logsumexp(mu)
     weights = np.exp(log_weights)
     log_mix = logsumexp(
@@ -1344,7 +1277,7 @@ def fit_gkm_weights_is(bank, log_g, alpha=0.05, n_iter=600,
     rejection = tail_rejection_probabilities(scores, mixture_rule)
     rp = ratios @ (bank.base_weights * rejection)
 
-    # This is a diagnostic only; GKM always use the O-th iterate.
+    # Assess complementarity at the final iterate without changing the fit.
     active = weights > active_weight_tol
     active_residual = (float(np.max(np.abs(rp[active] - alpha)))
                        if np.any(active) else 0.0)
@@ -1397,10 +1330,8 @@ def _canonical_pooled_mhg_diagnostics(diagnostics, expected_pairs):
                   for key, value in diagnostics["order_counts"].items()}
     except (TypeError, ValueError, AttributeError) as exc:
         raise ValueError("pooled bank MHG diagnostics are malformed") from exc
-    # A pair with an exactly zero hypergeometric argument is evaluated by the
-    # analytic 0F1=1 shortcut and is recorded at order zero without entering
-    # the C routine.  Every other pair must contribute at least one raw C
-    # evaluation; adaptive retries may make ``raw`` larger.
+    # Zero arguments use the analytic value 0F1=1 at order zero. Other pairs
+    # require at least one C evaluation; adaptive retries increase this count.
     minimum_raw = pairs - counts.get(0, 0)
     if (pairs != int(expected_pairs) or raw < minimum_raw or max_order < 0
             or not np.isfinite(max_remainder) or max_remainder < 0.0
@@ -1413,7 +1344,7 @@ def _canonical_pooled_mhg_diagnostics(diagnostics, expected_pairs):
 
 
 def _pooled_bank_content_signature(diagnostics_json=None, **arrays):
-    """Hash the exact numeric payload of a reusable pooled bank."""
+    """Hash the bank arrays and optional numerical diagnostics."""
     digest = hashlib.sha256()
     for name in sorted(arrays):
         array = np.ascontiguousarray(arrays[name])
@@ -1442,7 +1373,7 @@ def _pooled_bank_settings(grid, role, k_eff, n_per_stratum, seed,
 
 
 def _sample_pooled_null_eigenvalues(grid, k_eff, n_per_stratum, seed):
-    """Canonical bank draws, shared by local and multi-node builders."""
+    """Draw eigenvalues in null-grid order using a fixed random seed."""
     H = len(grid)
     p = len(grid[0]) + 1
     rng = np.random.default_rng(seed)
@@ -1461,7 +1392,7 @@ def build_or_load_pooled_is_bank(grid, k_eff, n_per_stratum, seed,
                                  M_max=MHG_DEFAULT_MAX, mhg_tol=MHG_CONV_TOL,
                                  n_workers=1, role="gkm",
                                  cache_dir=None, cache_metadata=None):
-    """Build/cache one beta-invariant GKM stratified null bank."""
+    """Load a compatible cached null bank or build one for reuse across betas."""
     try:
         grid_array = np.asarray(grid, dtype=float)
     except (TypeError, ValueError) as exc:
@@ -1565,7 +1496,7 @@ def build_or_load_pooled_is_bank(grid, k_eff, n_per_stratum, seed,
 
 
 def _finalize_pooled_is_bank(settings, eigs, log_f, diagnostics, cache_dir=None):
-    """Validate and save a complete bank assembled locally or from shards."""
+    """Validate a complete pooled null bank and optionally save it."""
     grid = np.asarray(settings["grid"], dtype=float)
     eigs = np.asarray(eigs, dtype=float)
     log_f = np.asarray(log_f, dtype=float)
@@ -1620,7 +1551,7 @@ def _finalize_pooled_is_bank(settings, eigs, log_f, diagnostics, cache_dir=None)
 
 
 def _authenticated_pooled_bank_settings(bank):
-    """Parse and authenticate a bank's settings and numeric content."""
+    """Check bank settings, metadata, and content hashes for consistency."""
     _validate_pooled_is_bank(bank)
     if (not isinstance(bank.settings_json, str) or not bank.settings_json
             or not isinstance(bank.content_signature, str)
@@ -1674,17 +1605,17 @@ def _authenticated_pooled_bank_settings(bank):
 
 
 # ============================================================
-# ALFD with eigenvalue density
+# Eigenvalue power bounds
 # ============================================================
 
 
 
 def _score_from_log_densities(log_densities, weights=None, *,
                               log_weights=None):
-    """Log likelihood-ratio score for a normalized finite null mixture.
+    """Return the alternative-to-null-mixture log likelihood ratio.
 
-    Direct GKM calculations pass ``log_weights`` so subnormal mixture masses
-    remain represented.  ``weights`` is retained for small public/test uses.
+    The final density row is the alternative; preceding rows are nulls.
+    Log weights preserve mixture masses too small for floating-point weights.
     """
     if (weights is None) == (log_weights is None):
         raise ValueError("provide exactly one of weights or log_weights")
@@ -1767,13 +1698,11 @@ def gkm_eigval_bound_from_pooled_bank(
         n_iter=600, seed=42, verbose=True, n_workers=1,
         M_trunc=20, M_step=MHG_DEFAULT_STEP,
         M_max=MHG_DEFAULT_MAX, mhg_tol=MHG_CONV_TOL):
-    """Dimension-generic implementation of GKM Supplement D.3.2 Steps 3--9.
+    """Compute GKM Supplement D.3.2 Steps 3--9 for one alternative.
 
-    The supplied bank is GKM's single Step-1/2 pooled ``N0`` experiment and
-    is reused for fitting, Step-6 mixture calibration, and Step-8 grid
-    adjustment.  Step 7 and Step 9 are evaluated on the same fresh ``N1``
-    alternative draws.  No support compression, independent audit,
-    sample-split recalibration, or Monte Carlo confidence correction is used.
+    The bank contains N0 draws per null-grid point and is reused for fitting,
+    Step 6 mixture calibration, and Step 8 grid adjustment. Steps 7 and 9
+    use the same N1 fresh alternative draws.
     """
     k_eff = _validated_integer("k_eff", k_eff)
     n_sim_power = _validated_integer(
@@ -1892,8 +1821,7 @@ def gkm_eigval_bound_from_pooled_bank(
             fit.training_rule.empirical_size, alpha, rtol=0.0, atol=5e-13):
         raise AssertionError("GKM Step-6 mixture calibration missed alpha")
 
-    # The shared bank's diagnostic is included for convenient max-order
-    # inspection.  Runtime accounting in main records its pairs only once.
+    # Include the shared bank when reporting the maximum truncation order.
     all_phases = dict(phase_diagnostics)
     all_phases["shared_null_bank"] = bank.mhg_diagnostics
     mhg_diagnostics = _combine_phase_mhg_diagnostics(all_phases)
@@ -1920,12 +1848,11 @@ def gkm_eigval_bound_from_pooled_bank(
 
 
 # ============================================================
-# Driver: common-grid production curve (9 beta points by default)
+# Command-line driver
 # ============================================================
 
 class _Tee:
-    """Duplicate writes to several streams (e.g. console + a log file), so the
-    run log lives in the output folder regardless of how the job is launched."""
+    """Write to each stream and flush after every write."""
     def __init__(self, *streams):
         self._streams = streams
 
@@ -1975,7 +1902,7 @@ def _format_duration(seconds):
 
 
 def _gkm_budget_diagnostics(alpha, common_grid_size, n_nonnull, budget):
-    """Exact logical-pair accounting for the direct GKM D.3.2 path."""
+    """Count density pairs for the null bank and non-null beta points."""
     if not (0.0 < alpha < 1.0):
         raise ValueError("alpha must lie in (0,1)")
     H = _validated_integer("common_grid_size", common_grid_size)
@@ -2029,19 +1956,13 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
                             n_samples, fit_grids,
                             benchmark_seed=MHG_BENCHMARK_SEED,
                             null_bank_only=False):
-    """Time a small deterministic batch of representative real density pairs.
+    """Benchmark adaptive density evaluation using a separate random stream.
 
-    The benchmark owns its ``Generator`` and exits before a production run is
-    initialized, so it neither consumes production random draws nor writes an
-    artifact.  Roughly two thirds of the samples span the common null grid and
-    one third are genuine Xi'Xi draws from the median-trace non-null
-    alternative.  This approximates the fresh production pair mix and exposes
-    costly boundary/stress draws that the former alternative-only benchmark
-    missed.  Every observation is evaluated against every fitted-null density
-    plus the alternative, matching production row batching. ``null_bank_only``
-    instead samples only null draws and evaluates only common null rows.
-    Alternative trace
-    quantiles from a larger candidate pool reduce small-batch noise.
+    Approximately two thirds of observations come from null-grid points.
+    The remainder are selected by trace quantiles from draws under the
+    median-trace alternative. Each observation is evaluated against all
+    null densities and that alternative. With ``null_bank_only``, both
+    observations and density rows are restricted to the null grid.
     """
     n_samples = _validated_integer("benchmark_samples", n_samples)
     n_workers = _validated_integer("n_workers", n_workers)
@@ -2086,9 +2007,7 @@ def _benchmark_adaptive_mhg(ncp_table, betas, total_logical_pairs, k_eff,
             benchmark_omegas, representative_omega[None]])
         benchmark_scope = "all_fitted_null_rows_plus_alternative"
 
-    # This generator is deliberately unrelated to all four production phase
-    # SeedSequences.  The constant seed makes target-machine comparisons
-    # repeatable even when the requested production seed changes.
+    # Use a separate RNG so benchmarking does not consume simulation draws.
     rng = np.random.default_rng(int(benchmark_seed))
     n_null_samples = (n_samples if null_bank_only else min(
         n_samples, max(1, int(round(2.0 * n_samples / 3.0)))))
@@ -2210,7 +2129,7 @@ def _print_mhg_benchmark(result):
 
 
 def _gkm_provenance(m_W):
-    """Shared scientific-code identity for local and multi-node null banks."""
+    """Record source, native-library, and environment metadata for saved results."""
     source_path = os.path.abspath(__file__)
     lib_name = "libmhg.dylib" if sys.platform == "darwin" else "libmhg.so"
     return dict(
@@ -2352,10 +2271,8 @@ def main():
         np.maximum(asymptotic_ncp_eigenvalues(b, kappas, k, n), 0.0)
         for b in betas])
     nonnull = betas != 0.0
-    # The nuisance grid is part of the statistical design, not a side effect
-    # of how densely the displayed beta curve is sampled.  Derive its two
-    # path-dependent shape directions from one fixed dense design path so
-    # changing --beta-count changes curve resolution only.
+    # Derive the null grid from a fixed beta path so --beta-count changes
+    # only the resolution of the reported power curve.
     grid_design_betas = np.linspace(
         -2.0, 2.0, GRID_DESIGN_BETA_COUNT)
     grid_design_nuisance = np.asarray([
@@ -2680,9 +2597,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # On macOS Python defaults to 'spawn'; calling freeze_support() is the
-    # standard guard so the worker processes import this module cleanly
-    # instead of re-executing main().
     import multiprocessing as mp
     mp.freeze_support()
     main()
