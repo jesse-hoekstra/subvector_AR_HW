@@ -1,4 +1,6 @@
-# Research code accompanying [Best Feasible Conditional Critical Values for a More Powerful Subvector Anderson-Rubin Test](https://arxiv.org/pdf/2601.17843). The repository contains power comparisons, power bound calculation and the Vietnam empirical analysis.
+# Research code accompanying [Best Feasible Conditional Critical Values for a More Powerful Subvector Anderson-Rubin Test](https://arxiv.org/pdf/2601.17843). 
+
+## The repository contains power comparisons, power bound calculation and the Vietnam empirical analysis.
 
 | File | Purpose |
 |---|---|
