@@ -29,11 +29,15 @@ sh koev/mhg15/build.sh
 ```
 
 The final command is needed only for the power bound and requires a C compiler
-on macOS or Linux. Use `--help` for simulation, bound and plotting options.
-The Vietnam analysis requires the original replication files in `data/Vietnam/`;
-these are not included.
+on macOS or Linux.
+For the Vietnam analysis, obtain the [replication files][vietnam-data] for
+Tanaka, Camerer and Nguyen (2010), [*Risk and Time Preferences: Linking
+Experimental and Household Survey Data from Vietnam*][vietnam-paper]. Place the
+contents of `20060431_data/` in `data/Vietnam/`; these files are not included.
 
 [gkm-supp]: https://www.econometricsociety.org/publications/quantitative-economics/2019/05/01/A-more-powerful-subvector-Anderson-Rubin-test-in-linear-instrumental-variables-regression/supp/666-3193-1-SP.pdf
 [gkm-code]: https://www.econometricsociety.org/publications/quantitative-economics/2019/05/01/A-more-powerful-subvector-Anderson-Rubin-test-in-linear-instrumental-variables-regression/supp/666-3195-1-SP.zip
 [koev-paper]: https://math.mit.edu/~edelman/publications/efficient_evaluation.pdf
 [koev-licence]: koev/mhg15/COPYRIGHT.TXT
+[vietnam-paper]: https://www.aeaweb.org/articles?id=10.1257/aer.100.1.557
+[vietnam-data]: https://www.openicpsr.org/openicpsr/project/112336/version/V1/view
