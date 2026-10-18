@@ -17,18 +17,6 @@ DGP_CACHE_SCHEMA_VERSION = 1
 DGP_CACHE_ALGORITHM = 'appendix_a3_feasible_power_v1'
 DGP_CACHE_PRODUCER = 'new_power_comparison.py'
 
-# These revisions preserve the original three-nuisance DGP draw stream and
-# numerical path. They predate support for the two-nuisance design, so their
-# hashes are accepted only for the original configurations. Accepting these
-# audited predecessor hashes preserves
-# existing expensive caches without turning source-hash validation into an
-# arbitrary-hash escape hatch.
-_TRUSTED_PRE_DGP_ONLY_SOURCE_SHA256 = frozenset({
-    '4b6c77087df18e90146a7a794cfb791556d6b8736ba214e30bcc910a93cf2123',
-    '52baf65840c5f785815bc74063909bd98177d67fc62189dd12fb968591984c6b',
-    '286f0ac6a9b4bbe3ac3b78aeaed355e055cca72509830d6c2a1574079cf094dc',
-})
-
 VERSION_LABELS = {
     '1515': (15, 15),
     '3515': (35, 15),
@@ -192,37 +180,20 @@ def save_dgp_cache(path, *, version_label, kappas, k, n, alpha, betas,
 
 def load_compatible_dgp_cache(path, *, version_label, kappas, k, n, alpha,
                               betas, num_simulations, base_seed, chunk_size):
-    """Load a DGP cache only when its full settings/provenance contract matches."""
+    """Load a DGP cache matching the current code, environment, and settings."""
     expected_settings = _dgp_cache_settings(
         version_label=version_label, kappas=kappas, k=k, n=n, alpha=alpha,
         betas=betas, num_simulations=num_simulations, base_seed=base_seed,
         chunk_size=chunk_size)
+    expected_json, expected_signature = _settings_json_and_signature(
+        expected_settings)
     with np.load(path, allow_pickle=False) as archive:
-        saved_source_hash = _npz_scalar(archive, 'source_sha256')
-        current_source_hash = expected_settings['source_sha256']
-        trusted_source_hashes = {current_source_hash}
-        if (version_label in ('352515', '1003015', '1009590')
-                and len(kappas) == 3):
-            trusted_source_hashes |= _TRUSTED_PRE_DGP_ONLY_SOURCE_SHA256
-        if saved_source_hash not in trusted_source_hashes:
-            raise ValueError(
-                'incompatible DGP cache: source_sha256='
-                f'{saved_source_hash!r} is not the current producer or an '
-                'audited DGP-equivalent predecessor')
-
-        # Reconstruct the exact settings contract used by the cache.  Only the
-        # explicitly audited predecessor hashes above may replace the current
-        # plotter hash; every other setting and provenance field remains an
-        # exact match, including the canonical JSON signature.
-        expected_settings['source_sha256'] = saved_source_hash
-        expected_json, expected_signature = _settings_json_and_signature(
-            expected_settings)
         scalar_expectations = {
             'schema_version': DGP_CACHE_SCHEMA_VERSION,
             'algorithm': DGP_CACHE_ALGORITHM,
             'producer': DGP_CACHE_PRODUCER,
             'version_label': str(version_label),
-            'source_sha256': saved_source_hash,
+            'source_sha256': expected_settings['source_sha256'],
             'gkm_sha256': expected_settings['gkm_sha256'],
             'settings_json': expected_json,
             'run_signature': expected_signature,

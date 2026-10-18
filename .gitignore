@@ -7,9 +7,10 @@ __pycache__/
 .venv/
 venv/
 .claude
-docs/*
-!docs/ALFD_power_bound_method.md
-!docs/run_10015_shapes31.md
+docs/
+tests/
+null_bank_cluster.py
+power_bound_cluster.py
 research_papers
 data/
 results/
@@ -18,6 +19,8 @@ results/
 5015/
 1515/
 3515/
+1003015/
+1009590/
 
 
 # Compiled mhg shared library (rebuild with koev/mhg15/build.sh)

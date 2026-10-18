@@ -1,9 +1,11 @@
 """Python wrapper for Plamen Koev's mhg (hypergeometric function of a matrix
 argument), via the standalone C core in mhg_core.c — no MATLAB/Octave needed.
 
-Build the shared library first (done by build.sh):
+Build the shared library and its source-hash stamp from the repository root:
 
-    clang -O3 -fPIC -shared mhg_core.c -o libmhg.dylib
+    sh koev/mhg15/build.sh
+
+This produces libmhg.dylib on macOS or libmhg.so on Linux.
 
 Usage mirrors the original MATLAB  [s,c] = mhg([MAX,K,lambda], alpha, p, q, x, [y]):
 

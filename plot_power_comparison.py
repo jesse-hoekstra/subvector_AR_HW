@@ -1,7 +1,9 @@
-"""Plot local DGP simulations alongside a completed distributed power bound.
+"""Plot DGP simulations alongside a completed alfd_eigval.py power bound.
 
 Reads saved results only. No null bank, native MHG library, or simulation is
-needed. Bound provenance is checked internally, not against the viewing machine.
+needed. Bound metadata is checked internally, not against the viewing machine.
+Direct results record a settings hash, not a content hash of their result arrays.
+Previously merged distributed results are also supported.
 """
 
 import argparse
@@ -78,9 +80,121 @@ def load_dgp(path):
 
 def load_bound(path):
     arrays = _read_npz(path)
-    if (_scalar(arrays, "schema_version") != 1
-            or _scalar(arrays, "producer") != "power_bound_cluster.py"):
-        raise ValueError("Expected a completed power_bound_cluster.py merged result")
+    schema, producer = _scalar(arrays, "schema_version"), _scalar(arrays, "producer")
+    if schema == 4 and producer == "alfd_eigval.py":
+        return _load_direct_bound(arrays)
+    if schema == 1 and producer == "power_bound_cluster.py":
+        return _load_distributed_bound(arrays)
+    raise ValueError("Expected a completed alfd_eigval.py result or merged distributed result")
+
+
+def _validate_power_estimates(arrays, betas):
+    for key in ("bounds", "mixture_power", "epsilon_grid"):
+        _validate_series(betas, arrays[key], key)
+    for key in ("bounds_se", "mixture_power_se"):
+        _validate_series(betas, arrays[key], key, probability=False)
+    if (np.any(arrays["bounds"] > arrays["mixture_power"] + 1e-12)
+            or not np.allclose(arrays["epsilon_grid"],
+                               arrays["mixture_power"] - arrays["bounds"],
+                               rtol=0, atol=1e-12)):
+        raise ValueError("bound power estimates are inconsistent")
+
+
+def _load_direct_bound(arrays):
+    """Read the completed schema-4 format without loading the numerical engine."""
+    final_fields = ("density_accuracy_scope", "common_null_grid", "common_grid_size",
+                    "bank_id", "bank_content_signature", "bank_mhg_diagnostics_json")
+    if any(key not in arrays for key in final_fields):
+        raise ValueError("Expected a completed alfd_eigval.py result, not a checkpoint")
+    settings = json.loads(_scalar(arrays, "settings_json"))
+    signature = _scalar(arrays, "run_signature")
+    if signature != _signature(settings):
+        raise ValueError("bound settings signature differs")
+    version = settings["version_label"]
+    if (version not in comparison.VERSION_LABELS
+            or not np.array_equal(settings["kappas"], comparison.VERSION_LABELS[version])):
+        raise ValueError("bound configuration differs from its version label")
+    mw = len(settings["kappas"])
+    expected = dict(schema_version=4, producer="alfd_eigval.py",
+                    algorithm=f"gkm_eigval_mw{mw}_adaptive_v4",
+                    calibration_method="gkm_step6_reused_pooled_bank")
+    for key, value in expected.items():
+        if settings[key] != value or _scalar(arrays, key) != value:
+            raise ValueError(f"unrecognized bound {key}")
+    if (_scalar(arrays, "bound_kind") != "gkm_d3_2_grid_adjusted_mc_power_bound"
+            or _scalar(arrays, "density_accuracy_scope") != "adaptive_empirical_tail_criterion"):
+        raise ValueError("unrecognized bound or density-accuracy method")
+    for key in ("version_label", "k", "n", "alpha", "seed", "M_start", "M_step",
+                "M_max", "mhg_rtol", "n_fit", "n_power", "n_iter", "grid_shapes",
+                "grid_strengths", "grid_max_strength", "grid_anchor_count",
+                "grid_design_beta_count"):
+        if _scalar(arrays, key) != settings[key]:
+            raise ValueError(f"bound {key} differs from settings")
+    if not np.array_equal(arrays["kappas"], settings["kappas"]):
+        raise ValueError("bound kappas differ from settings")
+
+    betas = arrays["betas"]
+    count = settings["beta_count"]
+    if (not isinstance(count, int) or count < 3 or count % 2 != 1
+            or not np.array_equal(betas, np.linspace(-2.0, 2.0, count))):
+        raise ValueError("bound beta grid differs from settings")
+    ncp, grid = arrays["ncp"], arrays["common_null_grid"]
+    size = _scalar(arrays, "common_grid_size")
+    for name, values, shape in (("alternative NCP", ncp, (count, mw + 1)),
+                                ("common null grid", grid, (size, mw))):
+        if (values.shape != shape or not np.all(np.isfinite(values))
+                or np.any(values < 0) or np.any(np.diff(values, axis=1) > 1e-10)):
+            raise ValueError(f"invalid bound {name}")
+    if size < 1 or not np.array_equal(grid, settings["common_grid"]):
+        raise ValueError("bound common null grid differs from settings")
+
+    _validate_power_estimates(arrays, betas)
+    null = betas == 0
+    for key, value in (("bounds", settings["alpha"]),
+                       ("mixture_power", settings["alpha"]),
+                       ("bounds_se", 0), ("mixture_power_se", 0), ("epsilon_grid", 0)):
+        if np.any(arrays[key][null] != value):
+            raise ValueError("bound beta=0 estimates differ from exact null randomization")
+    for key in ("fitted_weights", "fitted_log_weights",
+                "fit_rejection_probabilities", "grid_rejection_probabilities"):
+        if arrays[key].shape != (count, size) or not np.all(np.isfinite(arrays[key])):
+            raise ValueError(f"incomplete bound array {key}")
+    weights = arrays["fitted_weights"]
+    if (np.any(weights < 0) or not np.allclose(weights.sum(axis=1), 1, rtol=0, atol=1e-10)
+            or np.any(arrays["fitted_log_weights"] > 1e-12)
+            or not np.allclose(weights, np.exp(arrays["fitted_log_weights"]),
+                               rtol=1e-10, atol=1e-14)):
+        raise ValueError("bound mixture weights are inconsistent")
+    # Ordinary importance-sampling estimates need not be bounded above by one.
+    if (np.any(arrays["fit_rejection_probabilities"] < 0)
+            or np.any(arrays["grid_rejection_probabilities"] < 0)
+            or np.any(arrays["grid_rejection_probabilities"] > settings["alpha"] + 2e-12)):
+        raise ValueError("invalid bound grid rejection estimates")
+    for key in ("fit_iterations", "max_m_used"):
+        values = arrays[key]
+        if (values.shape != betas.shape or not np.all(np.isfinite(values))
+                or np.any(values < 0) or np.any(values != np.floor(values))):
+            raise ValueError(f"incomplete bound array {key}")
+    expected_iterations = np.where(betas == 0, 0, settings["n_iter"])
+    if not np.array_equal(arrays["fit_iterations"], expected_iterations):
+        raise ValueError("bound fit iteration counts differ from settings")
+    if arrays["diagnostics_json"].shape != betas.shape:
+        raise ValueError("incomplete bound diagnostics")
+    for record in arrays["diagnostics_json"]:
+        if not isinstance(json.loads(str(record)), dict):
+            raise ValueError("invalid bound diagnostics")
+    # These fields are written only in the final artifact, never a checkpoint.
+    for key in ("bank_id", "bank_content_signature"):
+        value = _scalar(arrays, key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"missing bound {key}")
+    if not isinstance(json.loads(_scalar(arrays, "bank_mhg_diagnostics_json")), dict):
+        raise ValueError("invalid bound bank diagnostics")
+    return dict(settings=dict(settings, version=version), run_signature=signature,
+                betas=betas, bounds=arrays["bounds"], bounds_se=arrays["bounds_se"])
+
+
+def _load_distributed_bound(arrays):
     manifest = json.loads(_scalar(arrays, "manifest_json"))
     signature = manifest["manifest_signature"]
     if signature != _signature({key: value for key, value in manifest.items()
@@ -118,15 +232,7 @@ def load_bound(path):
             or not np.array_equal(betas, [point["beta"] for point in points])
             or not np.array_equal(arrays["ncp"], [point["ncp"] for point in points])):
         raise ValueError("bound beta grid or alternative NCPs differ from manifest")
-    for key in ("bounds", "mixture_power", "epsilon_grid"):
-        _validate_series(betas, arrays[key], key)
-    for key in ("bounds_se", "mixture_power_se"):
-        _validate_series(betas, arrays[key], key, probability=False)
-    if (np.any(arrays["bounds"] > arrays["mixture_power"] + 1e-12)
-            or not np.allclose(arrays["epsilon_grid"],
-                               arrays["mixture_power"] - arrays["bounds"],
-                               rtol=0, atol=1e-12)):
-        raise ValueError("bound power estimates are inconsistent")
+    _validate_power_estimates(arrays, betas)
 
     # Reconstruct the exact per-beta payloads, so changing any result array
     # after the remote merge is detected without consulting the remote bank.
@@ -230,7 +336,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", default="10015", choices=list(comparison.VERSION_LABELS))
     parser.add_argument("--dgp-cache", help="default: VERSION/dgp/dgp_curves_VERSION.npz")
-    parser.add_argument("--bound", help="completed power_bound_cluster.py merged NPZ")
+    parser.add_argument("--bound", help="completed alfd_eigval.py NPZ (also accepts merged distributed results)")
     parser.add_argument("--output", help="PNG path; CSV is saved beside it")
     args = parser.parse_args(argv)
     path = args.dgp_cache or comparison.dgp_cache_path(args.version)
