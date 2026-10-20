@@ -1616,7 +1616,11 @@ def make_diagnostic_plot(
         color=gkm_color,
         linewidth=2.0,
         linestyle="--",
-        label=r"GKM cv $c_{0.95}(\widehat{\kappa}_{1n},1)$",
+        label=(
+            r"$c_{0.95}(\hat{\kappa}_{1n},1)$"
+            if use_gkm_paper_style
+            else r"GKM cv $c_{0.95}(\widehat{\kappa}_{1n},1)$"
+        ),
     )
     axis.plot(
         grid["beta0"],
@@ -1624,7 +1628,11 @@ def make_diagnostic_plot(
         color=hw_color,
         linewidth=2.0,
         linestyle="-.",
-        label=r"HW cv $c_{0.95}(\widehat{\kappa}_{(p-1)n},1)$",
+        label=(
+            r"$c_{0.95}(\hat{\kappa}_{(p-1)n},1)$"
+            if use_gkm_paper_style
+            else r"HW cv $c_{0.95}(\widehat{\kappa}_{(p-1)n},1)$"
+        ),
     )
     unconditional_df = problem.k - problem.m_w
     axis.plot(
@@ -1633,7 +1641,11 @@ def make_diagnostic_plot(
         color=unconditional_color,
         linewidth=1.7,
         linestyle=":",
-        label=rf"Unconditional cv $\chi^2_{{{unconditional_df},0.95}}$",
+        label=(
+            rf"$\chi^2_{{{unconditional_df},0.95}}$"
+            if use_gkm_paper_style
+            else rf"Unconditional cv $\chi^2_{{{unconditional_df},0.95}}$"
+        ),
     )
     axis.axvline(
         row.conditional_gkm.lower,
@@ -1723,17 +1735,23 @@ def make_diagnostic_plot(
             facecolor="white",
             edgecolor="#d1d5db",
             framealpha=0.95,
-            fontsize=8.2,
-            loc="upper center",
-            ncol=4,
-            columnspacing=1.25,
-            handlelength=2.4,
+            fontsize=15,
+            loc="lower left",
+            ncol=1,
+            handlelength=2.0,
         )
         figure.tight_layout()
     else:
         axis.legend(unique.values(), unique.keys(), frameon=False, fontsize=9)
         figure.tight_layout()
     figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    if problem.variable == "south":
+        with matplotlib.rc_context({"pdf.fonttype": 42}):
+            figure.savefig(
+                output_path.with_suffix(".pdf"),
+                format="pdf",
+                bbox_inches="tight",
+            )
     plt.close(figure)
 
 
